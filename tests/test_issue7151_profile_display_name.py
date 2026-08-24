@@ -159,6 +159,24 @@ class TestApiPayload:
         assert isinstance(row["display_name"], str)
         assert row["name"] == "default"
 
+    def test_display_name_upstream_attr_pre_stringified_falls_back(self, monkeypatch, tmp_path):
+        """Review #7156 r2: upstream pre-stringified display_name (e.g. "['friendly']", "42", "True") must not bypass normalizer."""
+        cases = {
+            "list-str": ("[friendly]", "['friendly']"),
+            "int-str": ("42", "42"),
+            "bool-str": ("true", "True"),
+        }
+        rows = []
+        for name, (yaml_val, attr_val) in cases.items():
+            pdir = tmp_path / "profiles" / name
+            pdir.mkdir(parents=True)
+            (pdir / "profile.yaml").write_text(f"display_name: {yaml_val}\n", encoding="utf-8")
+            rows.append(_profile_row(name, pdir, display_name=attr_val))
+        result = {row["name"]: row for row in _call_list_profiles_api(monkeypatch, rows)}
+        for name in cases:
+            assert result[name]["display_name"] == "", (
+                f"pre-stringified display_name in {name} must fall back to '' "
+                f"(got {result[name]['display_name']!r})")
 
 def _function_body(src: str, signature: str) -> str:
     start = src.find(signature)

@@ -2268,8 +2268,7 @@ def list_profiles_api() -> list:
             enabled_count, total_count = _get_profile_skills_stats(p.path)
             result.append({
                 'name': p.name,
-                'display_name': _normalize_display_name(getattr(p, 'display_name', ''))
-                    or _profile_display_name_from_meta(p.path),
+                'display_name': _profile_display_name_from_meta(p.path) if (p.path / "profile.yaml").exists() else _normalize_display_name(getattr(p, 'display_name', '')),
                 'path': str(p.path),
                 'is_default': p.is_default,
                 'is_active': p.name == active,
