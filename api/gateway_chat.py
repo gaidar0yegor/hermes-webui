@@ -924,6 +924,7 @@ def _run_gateway_runs_api_streaming(
     attachments=None, cfg=None, session=None,
     active_provider: str = "",
     on_run_id=None,
+    on_seq=None,
 ):
     """Submit via POST /v1/runs and relay SSE events including approval."""
     try:
@@ -1128,7 +1129,10 @@ def _run_gateway_runs_api_streaming(
                     stream_text, stream_usage, outcome = _relay_gateway_run_events(
                         resp, session_id, stream_id, run_id, base_url, api_key,
                         put_gateway_event=put_gateway_event, cancel_event=cancel_event,
-                        on_seq=lambda event_seq: last_seq.__setitem__(0, event_seq),
+                        # Cursor commit: the caller's hook when given (harness
+                        # observability), else the reconnect cursor.
+                        on_seq=on_seq if on_seq is not None else (
+                            lambda event_seq: last_seq.__setitem__(0, event_seq)),
                         # Seed/accumulate/adopt all run through the shared
                         # trio so the local carrier and STREAM_PARTIAL_TEXT
                         # cannot diverge (round-4 Greptile item 1).
