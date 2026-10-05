@@ -831,6 +831,207 @@ def test_completed_status_empty_output_keeps_streamed_text():
     assert result[0] == "Hello", f"streamed text must be kept, got {result!r}"
 
 
+# -------------------------- round-3 review: status-lane cancel persistence ----
+
+
+def _assistant_rows(messages):
+    return [m for m in (messages or []) if isinstance(m, dict) and m.get("role") == "assistant"]
+
+
+def test_status_lane_cancel_persists_partial_reasoning_and_tool_buffers():
+    """Round-3 item 2: when the watchdog's durable status resolves
+    cancelled, the turn reaches the cancelled-turn settle WITHOUT the browser
+    Stop path ever running — so the partial answer, reasoning trace, and live
+    tool buffers must be persisted into the session BEFORE teardown clears
+    them. Asserted on the persisted sidecar (fresh reload from disk)."""
+    import shutil
+    import tempfile
+    import pathlib
+
+    import api.models as models
+
+    tmp = tempfile.mkdtemp(prefix="watchdog-harness-sessions-")
+    saved_dir, saved_index = models.SESSION_DIR, models.SESSION_INDEX_FILE
+    saved_sessions = dict(models.SESSIONS)
+    models.SESSION_DIR = pathlib.Path(tmp)
+    models.SESSION_INDEX_FILE = pathlib.Path(tmp) / "_index.json"
+    models.SESSIONS.clear()
+    sid = "sess-watchdog-cancel-persist"
+    saved_reasoning = gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+    saved_tools = gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+    try:
+        session = models.Session(session_id=sid, title="Watchdog Harness", messages=[])
+        session.active_stream_id = STREAM_ID
+        session.pending_user_message = "hi"
+        session.pending_attachments = []
+        session.pending_started_at = None
+        session.save()
+        models.SESSIONS[sid] = session
+
+        # Buffers as the worker holds them mid-turn: run_turn() resets the
+        # shared partial buffer around the run (as the worker's setup does),
+        # so the streamed partial is set the way the worker would have it
+        # after the earlier connection — before the settle, after the run.
+        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+        gc.STREAM_REASONING_TEXT[STREAM_ID] = "thinking hard"
+        gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = [
+            {"name": "shell", "args": {"cmd": "ls"}, "done": False}]
+
+        harness = run_turn(
+            urlopen_script=[FakeSseResponse([b": ping", b""], end="eof")],
+            status_script=[{"status": "cancelled"}],
+        )
+        assert harness["result"][0] is None, harness["result"]
+        # A prior connection streamed a partial answer before the socket
+        # dropped; the durable status then resolved cancelled.
+        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = "partial answer so far"
+        # The production call site for the status lane (gateway_chat:
+        # `if final_text is None: _settle_gateway_cancelled_turn(...)`).
+        gc._settle_gateway_cancelled_turn(sid, STREAM_ID)
+
+        # Fresh reload from disk: the sidecar must carry the partial.
+        models.SESSIONS.pop(sid, None)
+        reloaded = models.get_session(sid)
+        assistant = _assistant_rows(reloaded.messages)
+        partials = [m for m in assistant if m.get("_partial")]
+        assert len(partials) == 1, f"exactly one partial row expected, got {assistant!r}"
+        partial = partials[0]
+        assert partial.get("content") == "partial answer so far", partial
+        assert partial.get("reasoning") == "thinking hard", partial
+        assert partial.get("_partial_tool_calls") == [
+            {"name": "shell", "args": {"cmd": "ls"}, "done": False}], partial
+        assert not partial.get("_error"), partial
+        # The user prompt and a cancel marker are present too, in order:
+        # user -> partial -> cancel marker.
+        assert any(
+            isinstance(m, dict) and m.get("role") == "user" and m.get("content") == "hi"
+            for m in reloaded.messages)
+        markers = [m for m in assistant if m.get("_error")]
+        assert len(markers) == 1, f"exactly one cancel marker expected, got {assistant!r}"
+        assert assistant.index(partial) < assistant.index(markers[0])
+        # Same persistence for the interrupted terminal state: a fresh turn
+        # admitted on the session (settle 1 cleared ownership, as cancel
+        # does), a new partial streamed, then the interrupted resolution.
+        reloaded.active_stream_id = STREAM_ID
+        reloaded.pending_user_message = "hi again"
+        reloaded.pending_attachments = []
+        reloaded.pending_started_at = None
+        reloaded.save()
+        models.SESSIONS[sid] = reloaded
+        harness = run_turn(
+            urlopen_script=[FakeSseResponse([b": ping", b""], end="eof")],
+            status_script=[{"status": "interrupted"}],
+        )
+        assert harness["result"][0] is None, harness["result"]
+        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = "interrupted partial"
+        gc.STREAM_REASONING_TEXT[STREAM_ID] = ""
+        gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = []
+        gc._settle_gateway_cancelled_turn(sid, STREAM_ID)
+        models.SESSIONS.pop(sid, None)
+        reloaded = models.get_session(sid)
+        partials = [m for m in _assistant_rows(reloaded.messages) if m.get("_partial")]
+        assert len(partials) == 2, f"interrupted lane must persist too, got {partials!r}"
+        assert partials[1].get("content") == "interrupted partial"
+    finally:
+        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+        gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+        if saved_reasoning is not None:
+            gc.STREAM_REASONING_TEXT[STREAM_ID] = saved_reasoning
+        if saved_tools is not None:
+            gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = saved_tools
+        models.SESSION_DIR, models.SESSION_INDEX_FILE = saved_dir, saved_index
+        models.SESSIONS.clear()
+        models.SESSIONS.update(saved_sessions)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_status_lane_cancel_successor_owner_and_empty_output_controls():
+    """Round-3 item 2 controls: (a) successor-owner — when the stream/turn
+    ownership moved to a successor (active_stream_id no longer ours), the
+    settle must not write over the successor's state; (b) empty-output —
+    with nothing buffered, no empty partial rows are appended and the settle
+    does not crash."""
+    import shutil
+    import tempfile
+    import pathlib
+
+    import api.models as models
+
+    tmp = tempfile.mkdtemp(prefix="watchdog-harness-sessions-")
+    saved_dir, saved_index = models.SESSION_DIR, models.SESSION_INDEX_FILE
+    saved_sessions = dict(models.SESSIONS)
+    models.SESSION_DIR = pathlib.Path(tmp)
+    models.SESSION_INDEX_FILE = pathlib.Path(tmp) / "_index.json"
+    models.SESSIONS.clear()
+    saved_reasoning = gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+    saved_tools = gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+    try:
+        # (a) successor owner: the session moved on to another stream.
+        sid = "sess-watchdog-cancel-successor"
+        session = models.Session(session_id=sid, title="Watchdog Harness", messages=[
+            {"role": "user", "content": "hi", "timestamp": 1},
+            {"role": "assistant", "content": "successor answer", "timestamp": 2},
+        ])
+        session.active_stream_id = "successor-stream-id"  # NOT ours
+        session.pending_user_message = None
+        session.save()
+        models.SESSIONS[sid] = session
+        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = "stale partial of the old turn"
+        gc.STREAM_REASONING_TEXT[STREAM_ID] = "stale reasoning"
+        gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = [{"name": "shell", "args": {}, "done": False}]
+        harness = run_turn(
+            urlopen_script=[FakeSseResponse([b": ping", b""], end="eof")],
+            status_script=[{"status": "cancelled"}],
+        )
+        assert harness["result"][0] is None
+        gc._settle_gateway_cancelled_turn(sid, STREAM_ID)  # must no-op
+        models.SESSIONS.pop(sid, None)
+        reloaded = models.get_session(sid)
+        assert [m.get("content") for m in reloaded.messages] == ["hi", "successor answer"], (
+            f"successor state must be untouched, got {reloaded.messages!r}")
+
+        # (b) empty output: nothing buffered -> no empty rows, no crash.
+        sid = "sess-watchdog-cancel-empty"
+        session = models.Session(session_id=sid, title="Watchdog Harness", messages=[])
+        session.active_stream_id = STREAM_ID
+        session.pending_user_message = "hi"
+        session.pending_attachments = []
+        session.pending_started_at = None
+        session.save()
+        models.SESSIONS[sid] = session
+        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+        gc.STREAM_REASONING_TEXT[STREAM_ID] = ""
+        gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = []
+        harness = run_turn(
+            urlopen_script=[FakeSseResponse([b": ping", b""], end="eof")],
+            status_script=[{"status": "cancelled"}],
+        )
+        assert harness["result"][0] is None
+        gc._settle_gateway_cancelled_turn(sid, STREAM_ID)
+        models.SESSIONS.pop(sid, None)
+        reloaded = models.get_session(sid)
+        assistant = _assistant_rows(reloaded.messages)
+        assert not [m for m in assistant if m.get("_partial")], (
+            f"no empty partial rows allowed, got {assistant!r}")
+        assert len(assistant) == 1 and assistant[0].get("_error"), assistant
+        assert any(
+            isinstance(m, dict) and m.get("role") == "user" and m.get("content") == "hi"
+            for m in reloaded.messages)
+    finally:
+        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+        gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+        if saved_reasoning is not None:
+            gc.STREAM_REASONING_TEXT[STREAM_ID] = saved_reasoning
+        if saved_tools is not None:
+            gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = saved_tools
+        models.SESSION_DIR, models.SESSION_INDEX_FILE = saved_dir, saved_index
+        models.SESSIONS.clear()
+        models.SESSIONS.update(saved_sessions)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ------------------------------------------------------------------ main ---
 
 
@@ -845,6 +1046,8 @@ def main():
         test_comment_only_stream_then_status_404_x2_probes_back_to_back,
         test_reset_events404_then_status404_x2_fails_closed_promptly,
         test_stop_between_grace_probes_surfaces_cancel_without_reconnect,
+        test_status_lane_cancel_persists_partial_reasoning_and_tool_buffers,
+        test_status_lane_cancel_successor_owner_and_empty_output_controls,
         test_status_503_during_stream_does_not_kill_live_run,
         test_stop_is_honoured_between_probe_retries,
         test_probe_budget_exhaustion_transient_errors_only,

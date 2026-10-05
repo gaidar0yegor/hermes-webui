@@ -1499,13 +1499,66 @@ def _settle_gateway_terminal_error(
 
 
 def _settle_gateway_cancelled_turn(session_id, stream_id) -> None:
-    """Keep the prompt and a cancel marker when the run ended cancelled and Stop did not already settle it."""
-    from api.streaming import _persist_cancelled_turn
+    """Keep the prompt, the streamed partial, and a cancel marker when the run ended cancelled and Stop did not already settle it."""
+    from api.streaming import (
+        _CANCEL_MARKER_PATTERNS,
+        _build_partial_message,
+        _materialize_pending_user_turn_before_error,
+        _partial_marker_already_present,
+        _persist_cancelled_turn,
+    )
 
     with _get_session_agent_lock(session_id):
         session = get_session(session_id)
         if not _stream_writeback_is_current(session, stream_id):
+            # Successor-owner control: the stream/turn ownership moved on
+            # (reattach rotation or a successor admission owns
+            # active_stream_id now) — never write over the successor's state.
             return
+        # Status-lane cancel persistence (round-3 review): the durable-status
+        # lane (cancelled/interrupted resolved by the watchdog's
+        # GET /v1/runs/{id} probe) reaches this settle WITHOUT the browser
+        # Stop path ever running, so cancel_stream()'s snapshot+upsert never
+        # happened and the already-streamed partial answer / reasoning /
+        # live tool buffers would be dropped by the teardown finally. This
+        # runs the SAME canonical cancellation persistence the SSE-cancel
+        # path uses (_build_partial_message + deduped upsert + cancel
+        # marker), but at a NEW call site: unlike the inherited SSE-cancel
+        # behaviour, the worker itself is settling here — its teardown
+        # finally has not popped the buffers yet — so it reads its own
+        # buffers directly, without cancel_stream's under-STREAMS_LOCK
+        # snapshot dance against a live worker.
+        # Empty-output control: _build_partial_message returns None when all
+        # three buffers are empty, so nothing is appended — no empty rows.
+        partial_msg = _build_partial_message(
+            STREAM_PARTIAL_TEXT.get(stream_id, ""),
+            STREAM_REASONING_TEXT.get(stream_id, ""),
+            list(STREAM_LIVE_TOOL_CALLS.get(stream_id, []) or []),
+        )
+        # Row order matches cancel_stream(): the user turn is materialized
+        # before the partial row is placed, and the partial is inserted
+        # before any cancel marker that is already present. Clearing the
+        # pending fields here keeps _persist_cancelled_turn's own
+        # materialize idempotent (no duplicate user row).
+        _materialize_pending_user_turn_before_error(session)
+        session.pending_user_message = None
+        session.pending_attachments = []
+        session.pending_started_at = None
+        session.pending_user_source = None
+        if partial_msg is not None:
+            if not isinstance(session.messages, list):
+                session.messages = []
+            marker_idx = len(session.messages)
+            for idx in range(len(session.messages) - 1, -1, -1):
+                row = session.messages[idx]
+                if not isinstance(row, dict) or row.get("role") != "assistant":
+                    continue
+                normalized = str(row.get("content") or "").strip().lower()
+                if any(pattern in normalized for pattern in _CANCEL_MARKER_PATTERNS):
+                    marker_idx = idx
+                    break
+            if not _partial_marker_already_present(session.messages, partial_msg, before_idx=marker_idx):
+                session.messages.insert(marker_idx, partial_msg)
         _persist_cancelled_turn(session, message="Cancelled by gateway")
         session.gateway_run = None
         session.save()
