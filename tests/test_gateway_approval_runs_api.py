@@ -1024,7 +1024,7 @@ def test_empty_id_runs_approval_reaches_real_response_lifecycle():
 
         events_connects = 0
 
-        def fake_urlopen(req, *, timeout=None):
+        def fake_urlopen(req, *, timeout=None, choice=choice):
             nonlocal events_connects
             if req.full_url.endswith("/v1/runs"):
                 return _JsonResponse()
