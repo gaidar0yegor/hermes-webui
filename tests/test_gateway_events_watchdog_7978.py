@@ -30,14 +30,29 @@ Regressions pinned (maintainer review of PR #7978):
 
 Round-2 review regressions pinned (2026-10-02):
 
-  4. socket reset after a partial delta -> events reconnect 404 -> status 404
-      -> the turn fails closed within <= 2 status probes and ZERO
-      poll-interval waits (a lost run must not spin the turn for the full
-      ~298s reattach budget); the same rule holds for a bare status 404.
+  4. socket reset after a partial delta -> status 404 -> the turn fails
+      closed within <= 2 status probes and ZERO poll-interval waits (a lost
+      run must not spin the turn for the full ~298s reattach budget); the
+      same rule holds for a bare status 404.
   5. the 404 grace is small and non-eager: a single 404 followed by
       ``running`` still lets the run complete, and a 404 interrupted by a
       503 restarts the streak (only CONSECUTIVE 404s are terminal) while
       the 503 alone keeps spending the long budget.
+
+Round-3 review regressions pinned (2026-10-03):
+
+  6. the 404 grace re-probe runs INSIDE status arbitration: on the first
+      status 404 the second probe happens BEFORE any /events reopen and
+      with ~0 fake-clock elapsed between the probes (pre-fix, the first
+      404 ``continue``d the outer loop and the next iteration reopened
+      /events, consuming a full watchdog interval of keepalives before
+      probe 2 — the maintainer's ~122s clock witnesses). Pinned for
+      keepalive-only and comment-only connections, and for the
+      reset -> status 404 prompt fail-closed path; Stop between the two
+      probes cancels without a reconnect; a 404 -> running -> completed
+      control proves the grace does not false-positive; the 503 in a
+      mixed 404/503/404->404 sequence resets the streak and keeps its
+      paced reconnect.
 
 Runs under pytest on supported interpreters and standalone on Python 3.14
 (``python3 tests/test_gateway_events_watchdog_7978.py``), where the repo
@@ -314,16 +329,16 @@ def test_events_404_after_partial_stream_interrupted_status_does_not_settle_part
 
 
 def test_events_404_then_status_404_fails_closed_within_two_probes():
-    """Round-2 (maintainer-timed scenario): socket reset after a partial
-    delta -> events reconnect 404 -> durable status 404 -> the turn must fail
-    closed within <= 2 status probes and ZERO poll-interval waits, not spin
-    the full ~298s reattach budget. Asserted on fake-clock steps, not just
-    the outcome."""
+    """Round-2 (maintainer-timed scenario) + round-3 call-order bar: socket
+    reset after a partial delta -> durable status 404 -> the turn must fail
+    closed within <= 2 status probes and ZERO poll-interval waits, and the
+    second probe must run BEFORE any /events reconnect (round-3 review: the
+    pre-fix branch reconnected events between the two probes)."""
     harness = run_turn(
         urlopen_script=[
             partial_delta("Hello", seq=0),   # partial text, then socket reset
-            _http_error(404),                # reconnect: gateway has no run
-            _http_error(404),                # grace re-probe's reconnect: still no run
+            _http_error(404),                # pre-fix would reconnect events here
+            _http_error(404),
         ],
         status_script=[
             _http_error(404),                # probe 1: definitive "no record of this run"
@@ -342,20 +357,26 @@ def test_events_404_then_status_404_fails_closed_within_two_probes():
     assert harness["clock"].now < 2 * GATEWAY_REATTACH_POLL_INTERVAL
     # Partial streamed text was never settled as success.
     assert harness["settles"] == []
-    # The grace re-probe still reconnected events with the Last-Event-ID cursor.
-    assert harness["urlopen"].header(1, "Last-Event-ID") == "0"
+    # Round-3 CALL ORDER: one events connect, then the two probes back to
+    # back — no /events reopen between probe 1 and probe 2.
+    assert harness["trace"] == [
+        ("events", 0.0), ("status", 0.0), ("status", 0.0)], harness["trace"]
+    assert len(harness["urlopen"].requests) == 1, (
+        f"no /events reconnect between the grace probes, "
+        f"got {len(harness['urlopen'].requests)} connects")
 
 
 def test_bare_status_404_grace_second_consecutive_404_fails_closed():
-    """Round-2: a status 404 is terminal after the small grace even without an
-    events failure in the picture: first 404 -> one immediate re-probe (no
-    sleep), second consecutive 404 -> fail closed. Pre-fix this scenario
-    spent the full 150-probe budget."""
+    """Round-2 + round-3: a status 404 is terminal after the small grace even
+    without an events failure in the picture: first 404 -> one immediate
+    re-probe (no sleep, no /events reopen), second consecutive 404 -> fail
+    closed. Pre-fix this scenario spent the full 150-probe budget (round-2)
+    and reconnected events between the probes (round-3)."""
     harness = run_turn(
         urlopen_script=[
             FakeSseResponse(
                 sse_frame(0, {"event": "message.delta", "delta": "Hello"}), end="eof"),
-            _http_error(404),                # grace re-probe's reconnect
+            _http_error(404),                # pre-fix would reconnect events here
         ],
         status_script=[
             _http_error(404),                # probe 1
@@ -370,16 +391,23 @@ def test_bare_status_404_grace_second_consecutive_404_fails_closed():
     assert harness["clock"].now == 0.0, (
         f"grace probes must not sleep the poll interval, spent {harness['clock'].now}s")
     assert harness["settles"] == []
+    assert harness["trace"] == [
+        ("events", 0.0), ("status", 0.0), ("status", 0.0)], harness["trace"]
+    assert len(harness["urlopen"].requests) == 1, (
+        f"no /events reconnect between the grace probes, "
+        f"got {len(harness['urlopen'].requests)} connects")
 
 
 def test_status_404_grace_does_not_false_positive_on_live_run():
-    """Round-2 grace safety: one status 404 followed by a 200 ``running``
-    resets the streak — the run keeps going and completes normally, proving
-    the grace is not overeager."""
+    """Round-2 grace safety + round-3 ordering control: one status 404
+    followed by a 200 ``running`` resets the streak — the run keeps going and
+    completes normally, proving the grace is not overeager. The ``running``
+    arbitration is what REOPENS /events (after the events-unreachable pacing
+    wait), never the 404 grace itself."""
     harness = run_turn(
         urlopen_script=[
             partial_delta("Hello", seq=0),   # partial text, then socket reset
-            _http_error(404),                # grace re-probe's reconnect
+            # (no reconnect between the probes — the grace re-probe is in-arbitration)
             FakeSseResponse(
                 keepalive()
                 + sse_frame(1, {"event": "run.completed", "output": "Hello world"}),
@@ -400,25 +428,31 @@ def test_status_404_grace_does_not_false_positive_on_live_run():
     # Exactly one poll-interval wait: the events-unreachable pacing after the
     # ``running`` probe. The 404 grace itself slept nothing.
     assert harness["clock"].now == GATEWAY_REATTACH_POLL_INTERVAL
+    # Round-3 CALL ORDER: both probes precede the reconnect, and the reconnect
+    # happens only after the ``running`` arbitration paced the reattach.
+    assert harness["trace"] == [
+        ("events", 0.0), ("status", 0.0), ("status", 0.0),
+        ("events", GATEWAY_REATTACH_POLL_INTERVAL)], harness["trace"]
 
 
 def test_status_404_streak_requires_consecutive_404s():
-    """Round-2: only CONSECUTIVE 404s are terminal — a 503 between two 404s
-    restarts the streak (and still spends the long budget); 404s themselves
-    never sleep the poll interval."""
+    """Round-2 + round-3: only CONSECUTIVE 404s are terminal — a 503 between
+    two 404s restarts the streak (and still spends the long budget, with its
+    poll-interval pacing wait); 404s themselves never sleep and never
+    reopen /events (the 503's paced reconnect is the only second connect)."""
     harness = run_turn(
         urlopen_script=[
             FakeSseResponse(
                 sse_frame(0, {"event": "message.delta", "delta": "Hello"}), end="eof"),
-            _http_error(404),                # reconnect after 404 #1
-            _http_error(404),                # reconnect after the 503
-            _http_error(404),                # reconnect after 404 #2 (grace)
+            _http_error(404),                # reconnect after the 503 pacing
+            _http_error(404),
+            _http_error(404),
         ],
         status_script=[
             _http_error(404),                # probe 1: streak = 1, immediate re-probe
-            _http_error(503),                # probe 2: transient -> streak reset, budget spent
+            _http_error(503),                # probe 2 (grace): transient -> streak reset, budget spent
             _http_error(404),                # probe 3: streak = 1 again
-            _http_error(404),                # probe 4: streak = 2 -> terminal
+            _http_error(404),                # probe 4 (grace): streak = 2 -> terminal
         ],
     )
 
@@ -428,6 +462,174 @@ def test_status_404_streak_requires_consecutive_404s():
     assert harness["status"].calls == 4
     # Only the 503 consumed a poll interval; neither 404 slept.
     assert harness["clock"].now == GATEWAY_REATTACH_POLL_INTERVAL
+    # Round-3 CALL ORDER: the 503's pacing is the only reconnect — probes 3
+    # and 4 run back to back inside arbitration (a missed streak reset would
+    # have failed the turn already at probe 3 with only 3 status calls).
+    assert harness["trace"] == [
+        ("events", 0.0), ("status", 0.0), ("status", 0.0),
+        ("events", GATEWAY_REATTACH_POLL_INTERVAL),
+        ("status", GATEWAY_REATTACH_POLL_INTERVAL),
+        ("status", GATEWAY_REATTACH_POLL_INTERVAL)], harness["trace"]
+    assert len(harness["urlopen"].requests) == 2, (
+        f"only the initial connect and the post-503 paced reconnect may happen, "
+        f"got {len(harness['urlopen'].requests)} connects")
+
+
+# ---------------------------------- round-3 review: in-arbitration grace ----
+
+
+def test_keepalive_only_stream_then_status_404_x2_probes_back_to_back():
+    """Round-3 primary finding (maintainer clock witnesses): a keepalive-only
+    connection trips the stall watchdog -> status probe 1 gets 404 -> the
+    grace re-probe must run IMMEDIATELY, BEFORE any /events reopen and with
+    ~0 fake-clock elapsed. Pre-fix the first 404 ``continue``d the outer
+    loop, reopening /events and burning another full watchdog interval of
+    keepalives (~120s scaled) before probe 2."""
+    clock = FakeClock()
+    harness = run_turn(
+        clock=clock,
+        urlopen_script=[
+            # Each keepalive block advances the fake clock 60s per line: the
+            # stall budget (120s of comment-only traffic) trips inside the
+            # first connection, and the second script entry is the reconnect
+            # the PRE-FIX branch would burn.
+            FakeSseResponse(keepalive() * 4, end="eof", clock=clock, advance_per_line=60.0),
+            FakeSseResponse(keepalive() * 4, end="eof", clock=clock, advance_per_line=60.0),
+        ],
+        status_script=[
+            _http_error(404),                # probe 1: definitive "no record of this run"
+            _http_error(404),                # probe 2 (grace): terminal
+        ],
+    )
+
+    raised = harness["result"]
+    assert isinstance(raised, RuntimeError), f"expected fail-closed raise, got {raised!r}"
+    assert "no longer has the run" in str(raised)
+    assert harness["status"].calls == 2
+    # CALL ORDER: one events connect, then the two probes back to back.
+    assert harness["trace"] == [
+        ("events", 0.0), ("status", 180.0), ("status", 180.0)], harness["trace"]
+    assert len(harness["urlopen"].requests) == 1, (
+        f"no /events reconnect between the grace probes, "
+        f"got {len(harness['urlopen'].requests)} connects")
+    # ELAPSED: probe 1 -> probe 2 delta is 0 fake seconds (no watchdog-interval
+    # wait); the whole turn cost one stall interval, not two.
+    probe_times = [t for kind, t in harness["trace"] if kind == "status"]
+    assert probe_times[1] - probe_times[0] == 0.0, harness["trace"]
+    assert harness["clock"].now == 180.0, harness["clock"].now
+
+
+def test_comment_only_stream_then_status_404_x2_probes_back_to_back():
+    """Round-3 comment-only variant: a connection that emits only comment
+    frames and then EOFs lands in the same arbitration — probe 1 (404) and
+    the grace re-probe run back to back with no /events reopen and no
+    elapsed time between them."""
+    clock = FakeClock()
+    comments = [b": ping", b""] * 2
+    harness = run_turn(
+        clock=clock,
+        urlopen_script=[
+            FakeSseResponse(comments, end="eof", clock=clock, advance_per_line=30.0),
+            FakeSseResponse(comments, end="eof", clock=clock, advance_per_line=30.0),
+        ],
+        status_script=[
+            _http_error(404),                # probe 1
+            _http_error(404),                # probe 2 (grace): terminal
+        ],
+    )
+
+    raised = harness["result"]
+    assert isinstance(raised, RuntimeError), f"expected fail-closed raise, got {raised!r}"
+    assert "no longer has the run" in str(raised)
+    assert harness["status"].calls == 2
+    assert harness["trace"] == [
+        ("events", 0.0), ("status", 120.0), ("status", 120.0)], harness["trace"]
+    assert len(harness["urlopen"].requests) == 1, (
+        f"no /events reconnect between the grace probes, "
+        f"got {len(harness['urlopen'].requests)} connects")
+    probe_times = [t for kind, t in harness["trace"] if kind == "status"]
+    assert probe_times[1] - probe_times[0] == 0.0, harness["trace"]
+
+
+def test_reset_events404_then_status404_x2_fails_closed_promptly():
+    """Round-3: reset -> durable status 404 -> the grace re-probe (404) must
+    fail the turn closed PROMPTLY — before any /events reconnect (the queued
+    keepalive connection must never be consumed) and inside an elapsed bound
+    well below one poll interval."""
+    harness = run_turn(
+        urlopen_script=[
+            partial_delta("Hello", seq=0),   # partial text, then socket reset
+            _http_error(404),                # pre-fix would reconnect events here
+            FakeSseResponse(keepalive() * 30, end="eof"),  # pre-fix kept the turn alive here
+        ],
+        status_script=[
+            _http_error(404),                # probe 1
+            _http_error(404),                # probe 2 (grace): terminal
+        ],
+    )
+
+    raised = harness["result"]
+    assert isinstance(raised, RuntimeError), f"expected fail-closed raise, got {raised!r}"
+    assert "no longer has the run" in str(raised)
+    assert harness["status"].calls == 2
+    assert harness["trace"] == [
+        ("events", 0.0), ("status", 0.0), ("status", 0.0)], harness["trace"]
+    assert len(harness["urlopen"].requests) == 1
+    # Elapsed bound: fails closed immediately, not after a full interval.
+    assert harness["clock"].now < GATEWAY_REATTACH_POLL_INTERVAL, harness["clock"].now
+
+
+def test_stop_between_grace_probes_surfaces_cancel_without_reconnect():
+    """Round-3: Stop pressed between the two 404 probes is honoured — the
+    turn cancels immediately, without the grace re-probe and without any
+    /events reopen."""
+    clock = FakeClock()
+    stop = FakeCancelEvent(clock)
+
+    status = ScriptedStatus()
+
+    def status_after_stop(base_url, api_key, run_id):
+        stop.set()  # user presses Stop the instant probe 1 answers 404
+        return status(base_url, api_key, run_id)
+
+    urlopen = ScriptedUrlopen()
+    urlopen.queue(FakeSseResponse(
+        sse_frame(0, {"event": "message.delta", "delta": "Hello"}), end="eof"))
+    urlopen.queue(_http_error(404))  # must never be consumed
+    status.queue(_http_error(404))
+    status.queue({"status": "running"})  # must never be reached
+
+    saved = []
+
+    def patch(obj, name, value):
+        saved.append((obj, name, getattr(obj, name)))
+        setattr(obj, name, value)
+
+    events = []
+    patch(gc, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+    patch(gc, "_admit_gateway_run", lambda *a, **k: RUN_ID)
+    patch(gc, "_get_gateway_run_status", status_after_stop)
+    patch(urllib.request, "urlopen", urlopen)
+    import api.route_approvals as ra
+
+    patch(ra, "settle_gateway_pending_run", lambda *a, **k: (0, None, 0))
+    gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+    try:
+        result = gc._run_gateway_runs_api_streaming(
+            "sess-watchdog-harness", "hi", "test-model", "/tmp", STREAM_ID,
+            BASE_URL, "test-key", [], {},
+            put_gateway_event=lambda name, payload: events.append((name, payload)),
+            cancel_event=stop,
+        )
+    finally:
+        for obj, name, value in reversed(saved):
+            setattr(obj, name, value)
+        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+
+    assert result[0] is None, f"Stop between the probes must cancel, got {result!r}"
+    assert any(name == "cancel" for name, _ in events), f"events={events!r}"
+    assert status.calls == 1, "no grace re-probe after Stop"
+    assert len(urlopen.requests) == 1, "no /events reopen after Stop"
 
 
 # --------------------------------------------------------------- Fix 2 -----
@@ -639,6 +841,10 @@ def main():
         test_bare_status_404_grace_second_consecutive_404_fails_closed,
         test_status_404_grace_does_not_false_positive_on_live_run,
         test_status_404_streak_requires_consecutive_404s,
+        test_keepalive_only_stream_then_status_404_x2_probes_back_to_back,
+        test_comment_only_stream_then_status_404_x2_probes_back_to_back,
+        test_reset_events404_then_status404_x2_fails_closed_promptly,
+        test_stop_between_grace_probes_surfaces_cancel_without_reconnect,
         test_status_503_during_stream_does_not_kill_live_run,
         test_stop_is_honoured_between_probe_retries,
         test_probe_budget_exhaustion_transient_errors_only,
