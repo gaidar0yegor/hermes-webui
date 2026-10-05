@@ -117,6 +117,24 @@ UTC sharpened the requirements):
       c. a delta frame AFTER the frame → ignored; the turn completes with
          the terminal answer, uncorrupted.
 
+Round-4 maintainer re-gate regressions pinned (2026-10-05 10:46 UTC, must
+fix + minor on the approval-mirror lane):
+
+  15. the status-payload approval mirror can invert the FIFO queue: the
+      durable status carries only the LATEST pending approval, so a stall
+      surfaces B and the replay then delivers A -> B — on a non-identity
+      gateway the shared dedupe set suppressed the replayed B and the
+      browser queue became B -> A (the approved card could resolve a
+      different command than the one shown). The status-card insert now
+      requires BOTH a non-blank raw ``approval_id``/``id`` AND the
+      ``approval_identity_v1`` capability; without them it is skipped
+      entirely and the cursor-ordered replay alone orders the queue.
+  16. identity-gateway variant: the exact-id status-card recovery is kept
+      — B cards from status, A cards from the replay, B deduped.
+  17. the status lane registers the approval key only AFTER the relay
+      inserts the card, so a payload the translator rejects no longer
+      suppresses the later event-feed replay of the same approval.
+
 Runs under pytest on supported interpreters and standalone on Python 3.14
 (``python3 tests/test_gateway_events_watchdog_7978.py``), where the repo
 suite's conftest gate refuses to run.
@@ -1058,12 +1076,15 @@ def test_r4_stop_during_byte_silence_cancels_within_budget():
 
 
 def test_r4_status_waiting_for_approval_surfaces_approval_card_once():
-    """Round-4 Greptile item 4: a durable status of ``waiting_for_approval``
-    carrying the approval payload surfaces the approval card exactly once
-    (mirroring the reattach path's parked-approval surface), even when the
-    events feed never delivered it. A re-probe carrying the same approval key
-    must NOT double-card, and a later ``completed`` status finalizes the turn
-    normally."""
+    """Round-4 Greptile item 4, identity-gateway contract (round-4 maintainer
+    must-fix): on a gateway advertising ``approval_identity_v1``, a durable
+    status of ``waiting_for_approval`` carrying the approval payload surfaces
+    the card exactly once (mirroring the reattach path's parked-approval
+    surface), even when the events feed never delivered it. A re-probe
+    carrying the same approval key must NOT double-card, and a later
+    ``completed`` status finalizes the turn normally. On non-identity
+    gateways the status-card insert is skipped entirely — the FIFO ordering
+    scenarios below pin that."""
     import api.config as api_config
 
     clock = FakeClock()
@@ -1092,8 +1113,10 @@ def test_r4_status_waiting_for_approval_surfaces_approval_card_once():
             {"status": "waiting_for_approval", "approval": dict(approval_payload)},
         ],
         extra_patches=[
-            # keep the capability probe off the scripted urlopen wire
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
+            # identity gateway: the raw approval_id carries the exact-id
+            # status-card recovery; the patch also keeps the capability
+            # probe off the scripted urlopen wire
+            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: True),
         ],
     )
     result = harness["result"]
@@ -1106,6 +1129,194 @@ def test_r4_status_waiting_for_approval_surfaces_approval_card_once():
     assert approvals[0]["approval_id"] == "appr-r4-1", approvals[0]
     assert approvals[0]["command"] == "ls -la /tmp", approvals[0]
     assert harness["status"].calls == 2
+
+
+def _approval_request_frame(seq, appr_id, command):
+    return sse_frame(seq, {
+        "event": "approval.request",
+        "approval_id": appr_id,
+        "tool": "shell",
+        "command": command,
+        "description": f"run {command}",
+        "pattern_key": "dangerous_command",
+        "pattern_keys": ["dangerous_command"],
+        "choices": ["once", "always"],
+        "risk_level": "high",
+    })
+
+
+def _pending_approval_payload(appr_id, command):
+    """Durable-status shape of one parked approval."""
+    return {
+        "approval_id": appr_id,
+        "tool": "shell",
+        "command": command,
+        "description": f"run {command}",
+        "risk_level": "high",
+        "choices": ["once", "always"],
+    }
+
+
+def test_r6_status_approval_mirror_skipped_without_identity_fifo_replay_orders_a_b():
+    """Maintainer round-4 must-fix repro: approvals queued A -> B on the
+    gateway, the watchdog stalls, the durable status carries only B, then the
+    events replay delivers A -> B. On a non-identity gateway the status-card
+    insert must be SKIPPED so the cursor-ordered replay alone surfaces the
+    queue A -> B. Pre-fix the status mirror surfaced B first and the replay's
+    B was suppressed by the shared dedupe set — the browser queue became
+    B -> A and the card the user approved could resolve a different pending
+    command than the one shown."""
+    import api.config as api_config
+
+    clock = FakeClock()
+    settles = []
+
+    def fake_settle(*args, **kwargs):
+        settles.append(kwargs.get("approval") or (args[1] if len(args) > 1 else None))
+        return False, None, 1  # not auto-approved -> the card is surfaced
+
+    harness = run_turn(
+        clock=clock,
+        urlopen_script=[
+            # keepalives only -> stall -> status probe 1 (carries B)
+            FakeSseResponse(keepalive() * 4, end="eof", clock=clock, advance_per_line=60.0),
+            # reconnect: the cursor-ordered replay delivers A then B, then
+            # keepalives stall again -> probe 2 (B again)
+            FakeSseResponse(
+                _approval_request_frame(1, "appr-A", "echo first")
+                + _approval_request_frame(2, "appr-B", "rm -rf /tmp/x")
+                + keepalive() * 4,
+                end="eof", clock=clock, advance_per_line=60.0,
+            ),
+            FakeSseResponse(
+                sse_frame(0, {"event": "run.completed", "output": "done after approvals"}),
+                end="eof",
+            ),
+        ],
+        status_script=[
+            {"status": "waiting_for_approval",
+             "approval": _pending_approval_payload("appr-B", "rm -rf /tmp/x")},
+            {"status": "waiting_for_approval",
+             "approval": _pending_approval_payload("appr-B", "rm -rf /tmp/x")},
+        ],
+        extra_patches=[
+            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
+            (gc, "_settle_gateway_run_approval", fake_settle),
+        ],
+    )
+    result = harness["result"]
+    assert result[0] == "done after approvals", (
+        f"run must finalize after the approval lane, got {result!r}")
+    approvals = [payload["approval_id"] for name, payload in harness["events"]
+                 if name == "approval"]
+    assert approvals == ["appr-A", "appr-B"], (
+        f"FIFO queue order must be preserved by the replay (A -> B), got {approvals}")
+    assert harness["status"].calls == 2, harness["trace"]
+
+
+def test_r6_identity_gateway_status_card_from_status_deduped_against_replay():
+    """Maintainer round-4 must-fix, identity-gateway variant: the exact-id
+    status-card recovery is KEPT. With ``approval_identity_v1`` advertised
+    and a raw approval id on the payload, the stalled probe surfaces B's
+    card from status, the replay then delivers A (surfaced) and B (deduped
+    by exact id) — each approval cards exactly once. (Not red by design:
+    pins the preserved behavior.)"""
+    import api.config as api_config
+
+    clock = FakeClock()
+
+    def fake_settle(*args, **kwargs):
+        return False, None, 1
+
+    harness = run_turn(
+        clock=clock,
+        urlopen_script=[
+            FakeSseResponse(keepalive() * 4, end="eof", clock=clock, advance_per_line=60.0),
+            FakeSseResponse(
+                _approval_request_frame(1, "appr-A", "echo first")
+                + _approval_request_frame(2, "appr-B", "rm -rf /tmp/x")
+                + keepalive() * 4,
+                end="eof", clock=clock, advance_per_line=60.0,
+            ),
+            FakeSseResponse(
+                sse_frame(0, {"event": "run.completed", "output": "done after approvals"}),
+                end="eof",
+            ),
+        ],
+        status_script=[
+            {"status": "waiting_for_approval",
+             "approval": _pending_approval_payload("appr-B", "rm -rf /tmp/x")},
+            {"status": "waiting_for_approval",
+             "approval": _pending_approval_payload("appr-B", "rm -rf /tmp/x")},
+        ],
+        extra_patches=[
+            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: True),
+            (gc, "_settle_gateway_run_approval", fake_settle),
+        ],
+    )
+    result = harness["result"]
+    assert result[0] == "done after approvals", (
+        f"run must finalize after the approval lane, got {result!r}")
+    approvals = [payload["approval_id"] for name, payload in harness["events"]
+                 if name == "approval"]
+    assert sorted(approvals) == ["appr-A", "appr-B"], (
+        f"each approval must card exactly once, got {approvals}")
+    assert approvals.count("appr-B") == 1, (
+        f"the status card must be deduped against the replay, got {approvals}")
+    assert harness["status"].calls == 2, harness["trace"]
+
+
+def test_r6_rejected_status_approval_payload_does_not_mask_replay():
+    """Maintainer round-4 minor: the status lane registered the approval key
+    BEFORE the relay call, so a payload the translator rejects (no tool,
+    command or description) still suppressed the later event-feed replay of
+    the same approval — the approval never surfaced at all. The key must be
+    registered only after the relay inserts the card, so a rejected status
+    payload never masks the replayed event."""
+    import api.config as api_config
+
+    clock = FakeClock()
+
+    def fake_settle(*args, **kwargs):
+        return False, None, 1
+
+    harness = run_turn(
+        clock=clock,
+        urlopen_script=[
+            # keepalives only -> stall -> probe 1 carries a REJECTED-shape
+            # approval (raw id present, no tool/command/description)
+            FakeSseResponse(keepalive() * 4, end="eof", clock=clock, advance_per_line=60.0),
+            # reconnect: the replay delivers the FULL approval, then stalls
+            FakeSseResponse(
+                _approval_request_frame(1, "appr-1", "ls -la /tmp")
+                + keepalive() * 4,
+                end="eof", clock=clock, advance_per_line=60.0,
+            ),
+            FakeSseResponse(
+                sse_frame(0, {"event": "run.completed", "output": "done"}),
+                end="eof",
+            ),
+        ],
+        status_script=[
+            {"status": "waiting_for_approval",
+             "approval": {"approval_id": "appr-1", "tool": "", "command": "",
+                          "description": ""}},
+            {"status": "waiting_for_approval",
+             "approval": _pending_approval_payload("appr-1", "ls -la /tmp")},
+        ],
+        extra_patches=[
+            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: True),
+            (gc, "_settle_gateway_run_approval", fake_settle),
+        ],
+    )
+    result = harness["result"]
+    assert result[0] == "done", f"run must finalize, got {result!r}"
+    approvals = [payload for name, payload in harness["events"] if name == "approval"]
+    assert len(approvals) == 1, (
+        f"the replayed approval must surface exactly once despite the "
+        f"rejected status payload, got {approvals!r}")
+    assert approvals[0]["approval_id"] == "appr-1", approvals[0]
+    assert approvals[0]["command"] == "ls -la /tmp", approvals[0]
 
 
 def test_r4_settle_flow_has_single_continue_branch():
@@ -1731,6 +1942,9 @@ def main():
         test_r5_event_header_framed_terminal_frame_breaks_out_of_keepalives,
         test_r5_socket_reset_after_terminal_frame_returns_immediately,
         test_r5_postterminal_delta_frame_ignored,
+        test_r6_status_approval_mirror_skipped_without_identity_fifo_replay_orders_a_b,
+        test_r6_identity_gateway_status_card_from_status_deduped_against_replay,
+        test_r6_rejected_status_approval_payload_does_not_mask_replay,
     ]
     failed = 0
     for test in tests:

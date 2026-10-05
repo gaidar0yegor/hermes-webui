@@ -585,11 +585,16 @@ def _gateway_approval_key(payload) -> str:
     return str(payload.get("approval_id") or payload.get("id") or payload.get("timestamp") or "")
 
 
-def _relay_gateway_run_approval(session_id, run_id, payload, base_url, api_key, *, put_gateway_event) -> None:
-    """Auto-approve or surface one runs-API approval request as a WebUI approval card."""
+def _relay_gateway_run_approval(session_id, run_id, payload, base_url, api_key, *, put_gateway_event) -> bool:
+    """Auto-approve or surface one runs-API approval request as a WebUI approval card.
+
+    Returns True when the payload was relayed (settled or surfaced as a
+    card) and False when the translator rejected it — callers that register
+    dedupe keys use that to avoid masking a later, well-formed replay of
+    the same approval (round-4 maintainer minor)."""
     approval_data = _gateway_runs_approval_event(payload)
     if not approval_data:
-        return
+        return False
     approval_data["run_id"] = run_id
     from api.config import gateway_supports_approval_identity_v1
     identity_v1 = bool(approval_data.get("_gateway_raw_approval_id_present")) and gateway_supports_approval_identity_v1(base_url, api_key)
@@ -602,6 +607,7 @@ def _relay_gateway_run_approval(session_id, run_id, payload, base_url, api_key, 
     )
     if not auto_approved:
         put_gateway_event("approval", {**(head or approval_data), "pending_count": total})
+    return True
 
 
 def _seed_gateway_stream_text(stream_id: str) -> str:
@@ -1084,19 +1090,38 @@ def _run_gateway_runs_api_streaming(
         card from status (the events feed may have lost it or be unable to
         replay it), deduped by approval key so reconnects and re-probes never
         double-card. ``waiting_for_approval`` is not terminal, so the caller
-        then continues the loop."""
+        then continues the loop.
+
+        Round-4 maintainer must-fix: the status payload carries only the
+        gateway's LATEST pending approval. Mirroring it ahead of the
+        cursor-ordered /events replay inverts the FIFO queue when several
+        approvals are pending (a stall surfaces B, the replay then delivers
+        A -> B, and the approved card can resolve a different command than
+        the one shown). Exact-id recovery is trustworthy only when the
+        payload carries a non-blank raw ``approval_id``/``id`` AND the
+        gateway advertises ``approval_identity_v1``; without both, skip the
+        status-card insert entirely so the replay alone orders the queue
+        A -> B."""
         approval = status.get("approval")
         if (
             str(status.get("status") or "").strip().lower() == "waiting_for_approval"
             and isinstance(approval, dict)
         ):
+            raw_approval_id = str(approval.get("approval_id") or approval.get("id") or "").strip()
+            from api.config import gateway_supports_approval_identity_v1
+            if not (raw_approval_id and gateway_supports_approval_identity_v1(base_url, api_key)):
+                return
             approval_key = _gateway_approval_key(approval)
             if approval_key and approval_key not in surfaced_approval_ids:
-                surfaced_approval_ids.add(approval_key)
-                _relay_gateway_run_approval(
+                relayed = _relay_gateway_run_approval(
                     session_id, run_id, approval, base_url, api_key,
                     put_gateway_event=put_gateway_event,
                 )
+                # Register only after a successful relay: a payload the
+                # translator rejects must not suppress the later event-feed
+                # replay of the same approval (round-4 maintainer minor).
+                if relayed:
+                    surfaced_approval_ids.add(approval_key)
 
     while True:
         if cancel_event.is_set():
