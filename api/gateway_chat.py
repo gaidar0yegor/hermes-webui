@@ -1154,10 +1154,15 @@ def _run_gateway_runs_api_streaming(
                     stream_text, stream_usage, outcome = _relay_gateway_run_events(
                         resp, session_id, stream_id, run_id, base_url, api_key,
                         put_gateway_event=put_gateway_event, cancel_event=cancel_event,
-                        # Cursor commit: the caller's hook when given (harness
-                        # observability), else the reconnect cursor.
-                        on_seq=on_seq if on_seq is not None else (
-                            lambda event_seq: last_seq.__setitem__(0, event_seq)),
+                        # Cursor commit: the internal reconnect cursor ALWAYS
+                        # advances (the next /events reopen must send
+                        # Last-Event-ID or delivered tokens replay into the
+                        # answer — round-5 review), then the optional
+                        # observer (harness/test seam) is notified.
+                        on_seq=lambda event_seq: (
+                            last_seq.__setitem__(0, event_seq),
+                            on_seq(event_seq) if on_seq is not None else None,
+                        ),
                         # Seed/accumulate/adopt all run through the shared
                         # trio so the local carrier and STREAM_PARTIAL_TEXT
                         # cannot diverge (round-4 Greptile item 1).

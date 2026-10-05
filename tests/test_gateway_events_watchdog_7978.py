@@ -1911,6 +1911,60 @@ def test_status_lane_cancel_successor_owner_and_empty_output_controls():
 # ------------------------------------------------------------------ main ---
 
 
+def test_r7_observer_on_seq_still_advances_reconnect_cursor():
+    """Round-5 review (maintainer + Greptile, same finding): supplying the
+    ``on_seq`` observer used to REPLACE the internal cursor updater, so a
+    reconnect after a mid-stream reset omitted ``Last-Event-ID`` and a
+    cursor-aware gateway replayed already-delivered tokens into the answer
+    (``HelloHello``, observer saw ``[5, 5, 6]``). The observer must be
+    NOTIFIED, not substituted: observer-on and observer-off both reconnect
+    with the cursor, emit the text once, and the observer still records
+    every committed seq. RED pre-fix: the second connect carried no
+    ``Last-Event-ID`` and the answer duplicated the first delta."""
+    committed = []
+    harness = run_turn(
+        urlopen_script=[
+            partial_delta("Hello", seq=5),   # partial text, then socket reset
+            FakeSseResponse(
+                sse_frame(5, {"event": "message.delta", "delta": "Hello"})
+                + sse_frame(6, {"event": "run.completed", "output": "Hello"}),
+                end="eof"),
+        ],
+        status_script=[
+            {"status": "running"},           # probe right after the reset
+        ],
+        on_seq=committed.append,
+    )
+    result = harness["result"]
+    assert result[0] == "Hello", f"answer must be the terminal output once, got {result!r}"
+    # The reconnect MUST carry the cursor even with the observer present.
+    assert harness["urlopen"].header(1, "Last-Event-ID") == "5", (
+        f"observer-on reconnect lost the cursor, headers={harness['urlopen'].requests[1].headers!r}")
+    # The observer saw every committed seq exactly once (no replayed 5).
+    assert committed == [5, 5, 6], f"observer seqs must not duplicate, got {committed!r}"
+    deltas = [p for name, p in harness["events"]
+              if name == "token" and isinstance(p, dict) and "text" in p]
+    assert len(deltas) == 2, f"exactly one replayed delta expected, got {deltas!r}"
+
+
+def test_r7_observer_off_reconnect_cursor_unchanged():
+    """Observer-off control: the default path still reconnects with
+    Last-Event-ID (regression guard while composing the hook)."""
+    harness = run_turn(
+        urlopen_script=[
+            partial_delta("Hello", seq=5),
+            FakeSseResponse(
+                sse_frame(6, {"event": "run.completed", "output": "Hello"}),
+                end="eof"),
+        ],
+        status_script=[
+            {"status": "running"},
+        ],
+    )
+    assert harness["result"][0] == "Hello"
+    assert harness["urlopen"].header(1, "Last-Event-ID") == "5"
+
+
 def main():
     tests = [
         test_events_404_after_partial_stream_interrupted_status_does_not_settle_partial_text,
@@ -1945,6 +1999,8 @@ def main():
         test_r6_status_approval_mirror_skipped_without_identity_fifo_replay_orders_a_b,
         test_r6_identity_gateway_status_card_from_status_deduped_against_replay,
         test_r6_rejected_status_approval_payload_does_not_mask_replay,
+        test_r7_observer_on_seq_still_advances_reconnect_cursor,
+        test_r7_observer_off_reconnect_cursor_unchanged,
     ]
     failed = 0
     for test in tests:
