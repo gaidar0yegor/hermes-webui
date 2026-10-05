@@ -91,6 +91,23 @@ Round-3 maintainer re-review regressions pinned (2026-10-05 08:57 UTC):
       boundary: a previous cancelled turn's marker is never reused for
       the new partial (must-fix 2).
 
+Greptile round-3 review regression pinned (2026-10-05 09:50 UTC, one P1 on
+40db362d — a round-4 latch regression):
+
+  14. the round-4 ``terminal_frame_seen`` latch removed the relay's ONLY
+      post-terminal exit: a gateway that keeps a completed run's events
+      connection open and feeds keepalives forever (no [DONE], no EOF)
+      pinned the loop — the latch disabled the stall check and the
+      keepalives kept the read timeout fed, so the completed answer was
+      stranded inside the relay and the caller's ``ended`` return was
+      unreachable. The fix is two-layer: the ``run.completed`` handler
+      breaks out on the frame itself (trailing frames are post-terminal
+      noise), and the stall check, should any path re-enter the loop
+      latched, finishes the turn as ``ended`` with the relayed text
+      instead of probing or failing. Both scenarios assert the turn
+      RETURNS the frame output within a bounded fake-clock window, with
+      NO status probe (the frame is the arbiter) and no events reopen.
+
 Runs under pytest on supported interpreters and standalone on Python 3.14
 (``python3 tests/test_gateway_events_watchdog_7978.py``), where the repo
 suite's conftest gate refuses to run.
@@ -205,6 +222,39 @@ def sse_frame(seq, payload):
 
 def keepalive():
     return [b": keepalive", b""]
+
+
+class InfiniteKeepaliveSseResponse(FakeSseResponse):
+    """SSE connection fake that replays its lines, then emits keepalives
+    FOREVER — no [DONE], no EOF (the post-terminal stream Greptile's round-3
+    review pinned). The per-line fake-clock advance models a live connection
+    whose bytes keep the real read timeout fed, so nothing but the relay's
+    own logic can end the turn.
+
+    A safety valve at ``max_keepalives`` raises ``socket.timeout`` so the
+    UNFIXED (red) run still terminates in bounded fake time; the fixed relay
+    breaks out at the terminal frame long before the valve."""
+    def __init__(self, lines, clock=None, advance_per_line=0.0, max_keepalives=8):
+        super().__init__(lines, end="eof", clock=clock, advance_per_line=advance_per_line)
+        self.max_keepalives = int(max_keepalives)
+        self.keepalives_sent = 0
+
+    def _gen(self):
+        for line in self.lines:
+            yield line
+            if self._advance:
+                self._clock.advance(self._advance)
+        while self.keepalives_sent < self.max_keepalives:
+            self.keepalives_sent += 1
+            yield b": keepalive"
+            if self._advance:
+                self._clock.advance(self._advance)
+            yield b""
+            if self._advance:
+                self._clock.advance(self._advance)
+        raise socket.timeout(
+            "harness safety valve: gateway never sent [DONE] nor closed "
+            f"after {self.keepalives_sent} keepalives")
 
 
 class ScriptedUrlopen:
@@ -762,7 +812,10 @@ def test_r4_run_completed_frame_latches_terminal_despite_keepalives():
     after the frame must not flip the outcome to ``stalled`` and force a
     status probe — a probe failure would FAIL a turn the gateway already
     finished. Call-order assertion: NO /v1/runs/{id} status GET after the
-    frame."""
+    frame. Greptile round-3 strengthening: the turn must also RETURN
+    promptly — on the unfixed branch the relay kept consuming the trailing
+    keepalives (fake clock 540s) before EOF; fixed, it breaks out on the
+    frame itself."""
     clock = FakeClock()
     harness = run_turn(
         clock=clock,
@@ -779,6 +832,104 @@ def test_r4_run_completed_frame_latches_terminal_despite_keepalives():
     assert result[0] == "Done answer", f"turn must complete from the frame, got {result!r}"
     assert harness["status"].calls == 0, "no status GET may follow the terminal frame"
     assert [t for t in harness["trace"] if t[0] == "status"] == [], harness["trace"]
+    assert clock.now <= _R4_WATCHDOG_BUDGET_BOUND, (
+        f"turn must return promptly on the terminal frame, burned {clock.now}s")
+
+
+_R5_POSTTERMINAL_BOUND = 480.0  # the pre-terminal frames' fake-clock cost + slack
+
+
+def test_r5_run_completed_breaks_out_of_infinite_postterminal_keepalives():
+    """Greptile round-3 P1 (regression from the round-4 latch): a completed
+    run's events connection stays open and feeds keepalives FOREVER — no
+    [DONE], no EOF. The round-4 latch disabled the stall check, so nothing
+    ended the relay and the completed answer was stranded (the caller's
+    ``ended`` return was unreachable). The turn must RETURN the frame's
+    output within a bounded fake-clock window, with NO status probe (the
+    terminal frame is the arbiter) and no events reopen. Red on 40db362d:
+    the relay consumed keepalives to the harness safety valve (fake clock
+    ~1.4ks), then the valve's timeout forced a status poll that returned
+    different text."""
+    import api.config as api_config
+
+    clock = FakeClock()
+    approval_settles = []
+    harness = run_turn(
+        clock=clock,
+        urlopen_script=[
+            InfiniteKeepaliveSseResponse(
+                sse_frame(1, {
+                    "event": "approval.request", "command": "rm -rf /tmp/x",
+                    "description": "Dangerous command approval",
+                    "pattern_key": "dangerous_command",
+                    "pattern_keys": ["dangerous_command"],
+                    "choices": ["once", "always"], "approval_id": "appr-r5-1",
+                })
+                + sse_frame(2, {"event": "message.delta", "delta": "streamed "})
+                + sse_frame(3, {"event": "run.completed", "output": "Hello"}),
+                clock=clock, advance_per_line=60.0,
+            ),
+        ],
+        status_script=[
+            # Red-only: reached after the safety-valve timeout. The fixed
+            # relay must never get here — the frame is the arbiter.
+            {"status": "completed", "output": "status-poll-text"},
+        ],
+        extra_patches=[
+            (gc, "_settle_gateway_run_approval",
+             lambda *a, **k: approval_settles.append(k) or (True, {"approval_id": "appr-r5-1"}, 0)),
+            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
+        ],
+    )
+    result = harness["result"]
+    assert result[0] == "Hello", (
+        f"turn must return the terminal frame's output, got {result!r}")
+    assert len(approval_settles) == 1, harness["trace"]
+    assert harness["status"].calls == 0, "no status GET may follow the terminal frame"
+    assert [t for t in harness["trace"] if t[0] == "status"] == [], harness["trace"]
+    assert len(harness["urlopen"].requests) == 1, (
+        "the terminal frame must end the turn without reopening /events")
+    assert clock.now <= _R5_POSTTERMINAL_BOUND, (
+        f"turn must return promptly on the terminal frame, burned {clock.now}s")
+
+
+def test_r5_event_header_framed_terminal_frame_breaks_out_of_keepalives():
+    """Variant: the terminal frame is framed with the SSE ``event:`` header
+    (payload carries no event key — the relay falls back to ``sse_event``),
+    deltas stream before it, [DONE] is never sent, and the keepalives run
+    forever. Same assertions: the turn returns "Hello" promptly with no
+    status probe and no events reopen. Red on 40db362d for the same
+    mechanism as the JSON-framed scenario."""
+    import api.config as api_config
+
+    clock = FakeClock()
+    frame_lines = (
+        [b"event: message.delta", b"data: " + json.dumps({"delta": "streamed "}).encode(), b""]
+        + [b"event: run.completed", b"data: " + json.dumps({"output": "Hello"}).encode(), b""]
+    )
+    harness = run_turn(
+        clock=clock,
+        urlopen_script=[
+            InfiniteKeepaliveSseResponse(
+                frame_lines, clock=clock, advance_per_line=60.0),
+        ],
+        status_script=[
+            # Red-only: reached after the safety-valve timeout.
+            {"status": "completed", "output": "status-poll-text"},
+        ],
+        extra_patches=[
+            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
+        ],
+    )
+    result = harness["result"]
+    assert result[0] == "Hello", (
+        f"turn must return the terminal frame's output, got {result!r}")
+    assert harness["status"].calls == 0, "no status GET may follow the terminal frame"
+    assert [t for t in harness["trace"] if t[0] == "status"] == [], harness["trace"]
+    assert len(harness["urlopen"].requests) == 1, (
+        "the terminal frame must end the turn without reopening /events")
+    assert clock.now <= _R5_POSTTERMINAL_BOUND, (
+        f"turn must return promptly on the terminal frame, burned {clock.now}s")
 
 
 def test_r4_byte_silent_stream_probes_status_within_watchdog_budget():
@@ -1498,6 +1649,8 @@ def main():
         test_r4_settle_flow_has_single_continue_branch,
         test_r4_cancel_marker_scan_stops_at_turn_boundary,
         test_r4_status_lane_cancel_persists_before_cancel_event,
+        test_r5_run_completed_breaks_out_of_infinite_postterminal_keepalives,
+        test_r5_event_header_framed_terminal_frame_breaks_out_of_keepalives,
     ]
     failed = 0
     for test in tests:

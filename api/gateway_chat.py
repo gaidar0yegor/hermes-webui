@@ -710,8 +710,11 @@ def _relay_gateway_run_events(
     connection that delivers nothing but comment/keepalive frames for that long as stalled and
     returns so the caller can consult the durable run status: keepalives are liveness, not
     progress (this exact case pinned a single-connection loop forever — #7978). Once
-    ``run.completed`` is seen the outcome latches to "ended" and further keepalive-only intervals
-    on that connection cannot flip it to "stalled" (round-4 review: the frame is terminal).
+    ``run.completed`` is seen the outcome latches to "ended": the relay breaks
+    out on the frame itself (trailing keepalives/[DONE] are post-terminal
+    noise), and as a backstop any keepalive-only interval that slips past the
+    latch finishes the turn as "ended" instead of probing (round-4 review: the
+    frame is terminal; Greptile round-3: the latch must leave an exit).
     """
     usage: dict = {}
     outcome = "eof"
@@ -755,13 +758,16 @@ def _relay_gateway_run_events(
             # progress) while a REAL data frame arriving after a silent gap
             # is processed as progress below instead of being discarded and
             # re-fetched via replay. Once run.completed has been seen the
-            # outcome is latched (round-4 item 2): no keepalive interval may
-            # flip an already-terminal lane into probing/failing.
-            if (
-                watchdog_secs is not None
-                and not terminal_frame_seen
-                and time.monotonic() - last_progress > watchdog_secs
-            ):
+            # outcome is latched (round-4 item 2): a keepalive interval past
+            # the frame cannot flip the lane to "stalled" — post-terminal
+            # stall means the stream refused to close after a terminal
+            # frame, and the turn is already complete, so it finishes with
+            # the relayed text instead of probing/failing (Greptile round-3:
+            # the round-4 latch must not leave the loop without an exit).
+            if watchdog_secs is not None and time.monotonic() - last_progress > watchdog_secs:
+                if terminal_frame_seen:
+                    outcome = "ended"
+                    break
                 logger.warning(
                     "Gateway events stream for run %s stalled "
                     "(no real events past %ss); probing run status",
@@ -839,12 +845,17 @@ def _relay_gateway_run_events(
                 final_text = _adopt_gateway_stream_text(stream_id, output)
             usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v})
             outcome = "ended"
-            # Terminal latch (round-4 item 2): keepalives after this frame are
-            # ignored by the stall check; [DONE] handling is unchanged.
             terminal_frame_seen = True
             commit()
-            sse_event = "message"
-            continue
+            # A terminal frame definitionally ends the run: break instead of
+            # reading on (Greptile round-3). Trailing frames on a healthy
+            # gateway — including [DONE] — are post-terminal noise, and
+            # `with resp:` closes the socket on the way out. Continuing here
+            # stranded the completed turn inside the relay: the round-4 latch
+            # disables the stall check, so endless keepalives pinned the loop
+            # forever. (The watchdog branch above keeps an exit as a backstop
+            # for any future path that re-enters the read loop latched.)
+            break
         if payload_event == "run.failed":
             from api.route_approvals import settle_gateway_pending_run
             settle_gateway_pending_run(
