@@ -54,6 +54,43 @@ Round-3 review regressions pinned (2026-10-03):
       mixed 404/503/404->404 sequence resets the streak and keeps its
       paced reconnect.
 
+Round-4 review regressions pinned (2026-10-05, Greptile findings + maintainer
+round-3 re-review of 56f8d50c):
+
+  7. a mid-stream socket drop discards the relay's local text carrier
+      (the exception bypasses its return), so a ``completed`` durable
+      status with an EMPTY output must fall back to the accumulated
+      partial text — the turn never settles empty when partial text
+      exists (Greptile item 1 + maintainer must-fix 1: the transport-
+      exception handler re-syncs ``final_text`` from the shared buffer).
+  8. ``run.completed`` is terminal: keepalives after the frame must not
+      flip the lane to ``stalled`` and force a status probe (item 2).
+  9. a byte-SILENT connection (no lines at all) must surface within the
+      watchdog budget — the per-read wait is bounded, not the full 600s
+      read timeout — and Stop pressed during the silence cancels inside
+      that same budget (item 3).
+  10. a durable status of ``waiting_for_approval`` carrying the approval
+      payload surfaces the approval card exactly once, mirroring the
+      reattach path, and a re-probe must not double-card (item 4).
+  11. the settle flow has exactly ONE ``action == "continue"`` branch
+      (item 6, also a maintainer nit: the duplicated dead branch is gone).
+  12. maintainer must-fix 2: the cancelled-turn marker scan stops at the
+      current user-turn boundary (a historical marker from a previous
+      cancelled turn is never reused for this turn's partial).
+  13. maintainer should-fix: the status-lane cancel persists the cancelled
+      turn BEFORE emitting the browser-facing cancel event (the browser
+      refetches the session the moment the event lands; the event callback
+      here plays the browser and asserts the partial is already on disk).
+
+Round-3 maintainer re-review regressions pinned (2026-10-05 08:57 UTC):
+
+  12. the status-lane cancel persists the cancelled turn BEFORE emitting
+      the browser-facing cancel event — the refetch-at-event-time proof
+      (should-fix 3).
+  13. the cancel-marker backward scan stops at the current user-turn
+      boundary: a previous cancelled turn's marker is never reused for
+      the new partial (must-fix 2).
+
 Runs under pytest on supported interpreters and standalone on Python 3.14
 (``python3 tests/test_gateway_events_watchdog_7978.py``), where the repo
 suite's conftest gate refuses to run.
@@ -64,6 +101,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import sys
 import types
 import urllib.error
@@ -172,6 +210,7 @@ def keepalive():
 class ScriptedUrlopen:
     def __init__(self):
         self.requests = []
+        self.timeouts = []
         self.script = []
 
     def queue(self, outcome):
@@ -179,6 +218,7 @@ class ScriptedUrlopen:
 
     def __call__(self, req, timeout=None):
         self.requests.append(req)
+        self.timeouts.append(timeout)
         outcome = self.script.pop(0) if self.script else None
         if outcome is None:
             raise AssertionError(
@@ -193,6 +233,41 @@ class ScriptedUrlopen:
             if key.lower() == name.lower():
                 return value
         return None
+
+
+class SilentSseResponse:
+    """Byte-SILENT SSE connection fake (round-4 item 3): accepts the request,
+    then sends NOTHING — not even keepalives. The first read blocks for the
+    connection's full read timeout (whatever the code under test passed to
+    ``urlopen``, recorded by ``ScriptedUrlopen.timeouts`` and bound at queue
+    time) and then raises ``socket.timeout`` — exactly how a real dead socket
+    behind a dropped NAT mapping behaves. The fake clock is advanced by that
+    timeout first, so elapsed-bound assertions measure the configured wait."""
+
+    def __init__(self, clock, set_cancel=None):
+        self._clock = clock
+        self._set_cancel = set_cancel
+        self._timeouts = None
+
+    def bind_timeouts(self, timeouts):
+        self._timeouts = timeouts
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __iter__(self):
+        return self._gen()
+
+    def _gen(self):
+        if self._set_cancel is not None:
+            self._set_cancel()  # the user presses Stop during the silence
+        blocked = float(self._timeouts[-1]) if self._timeouts else 0.0
+        self._clock.advance(blocked)
+        raise socket.timeout(f"the read blocked for {blocked}s (byte-silent socket)")
+        yield  # unreachable; makes _gen a generator
 
 
 class ScriptedStatus:
@@ -221,20 +296,40 @@ def _http_error(code):
     )
 
 
-def run_turn(*, urlopen_script=(), status_script=(), cancel_event=None, clock=None):
-    """Run the real streaming function against the fakes; restore all patches."""
+def run_turn(*, urlopen_script=(), status_script=(), cancel_event=None, clock=None,
+             cancel_settle="stub", extra_patches=()):
+    """Run the real streaming function against the fakes; restore all patches.
+
+    ``cancel_settle="stub"`` (default) replaces ``_settle_gateway_cancelled_turn``
+    with a traced no-op so status-lane cancel scenarios stay hermetic (they run
+    against session ids with no Session object); the round-3 persistence tests
+    call the real settle manually after the turn, exactly as the worker caller
+    site does. ``cancel_settle="real"`` traces and CALLS the real settle inside
+    the turn (round-4 persist-first proofs use this with real temp sessions).
+    Settle calls are recorded into ``trace`` as ("cancel_settle", clock) either
+    way, so ordering against the cancel event can be asserted."""
     clock = clock or FakeClock()
     urlopen = ScriptedUrlopen()
     status = ScriptedStatus()
     events = []
     trace = []
     for outcome in urlopen_script:
+        if isinstance(outcome, SilentSseResponse):
+            outcome.bind_timeouts(urlopen.timeouts)
         urlopen.queue(outcome)
     for outcome in status_script:
         status.queue(outcome)
 
     saved = []
     settles = []
+
+    real_cancel_settle = gc._settle_gateway_cancelled_turn
+
+    def traced_cancel_settle(session_key, stream_key):
+        trace.append(("cancel_settle", clock.now))
+        if cancel_settle == "real":
+            return real_cancel_settle(session_key, stream_key)
+        return None
 
     def patch(obj, name, value):
         saved.append((obj, name, getattr(obj, name)))
@@ -249,7 +344,10 @@ def run_turn(*, urlopen_script=(), status_script=(), cancel_event=None, clock=No
     patch(gc, "time", types.SimpleNamespace(monotonic=clock.monotonic))
     patch(gc, "_admit_gateway_run", lambda *a, **k: RUN_ID)
     patch(gc, "_get_gateway_run_status", traced("status", status))
+    patch(gc, "_settle_gateway_cancelled_turn", traced_cancel_settle)
     patch(urllib.request, "urlopen", traced("events", urlopen))
+    for obj, name, value in extra_patches:
+        patch(obj, name, value)
 
     import api.route_approvals as ra
 
@@ -632,6 +730,340 @@ def test_stop_between_grace_probes_surfaces_cancel_without_reconnect():
     assert len(urlopen.requests) == 1, "no /events reopen after Stop"
 
 
+# ---------------------------- round-4 review (Greptile + maintainer) -------
+
+
+_R4_WATCHDOG_BUDGET_BOUND = 125.0  # 120s budget + read epsilon + slack
+
+
+def test_r4_transport_reset_completed_empty_output_returns_partial_text():
+    """Round-4 Greptile item 1 + maintainer must-fix 1: a mid-stream socket
+    reset discards the relay's LOCAL text carrier (the exception bypasses its
+    return), and the durable status then reports ``completed`` with an EMPTY
+    output. The settle path is deterministic: status output when non-empty,
+    ELSE the accumulated partial text (either carrier) — never empty when
+    partial text exists. (Pre-fix this settled "" and cleared pending state;
+    maintainer repro.)"""
+    harness = run_turn(
+        urlopen_script=[
+            partial_delta("Hello", seq=0),   # partial text, then socket reset
+        ],
+        status_script=[
+            {"status": "completed", "output": ""},
+        ],
+    )
+    result = harness["result"]
+    assert result[0] == "Hello", (
+        f"completed-with-empty-output must keep the streamed partial, got {result!r}")
+
+
+def test_r4_run_completed_frame_latches_terminal_despite_keepalives():
+    """Round-4 Greptile item 2: ``run.completed`` is terminal. Keepalives
+    after the frame must not flip the outcome to ``stalled`` and force a
+    status probe — a probe failure would FAIL a turn the gateway already
+    finished. Call-order assertion: NO /v1/runs/{id} status GET after the
+    frame."""
+    clock = FakeClock()
+    harness = run_turn(
+        clock=clock,
+        urlopen_script=[
+            FakeSseResponse(
+                sse_frame(0, {"event": "run.completed", "output": "Done answer"})
+                + keepalive() * 4,
+                end="eof", clock=clock, advance_per_line=60.0,
+            ),
+        ],
+        status_script=[],  # ANY probe here is the bug
+    )
+    result = harness["result"]
+    assert result[0] == "Done answer", f"turn must complete from the frame, got {result!r}"
+    assert harness["status"].calls == 0, "no status GET may follow the terminal frame"
+    assert [t for t in harness["trace"] if t[0] == "status"] == [], harness["trace"]
+
+
+def test_r4_byte_silent_stream_probes_status_within_watchdog_budget():
+    """Round-4 Greptile item 3: a connection that accepts the request then
+    sends NOTHING (no lines at all) must surface within the watchdog budget —
+    the per-read wait is bounded, so byte-silence cannot pin the full
+    configured 600s read timeout before the status probe runs. Elapsed bound
+    asserted on the fake clock AND on the timeout passed to urlopen."""
+    clock = FakeClock()
+    harness = run_turn(
+        clock=clock,
+        urlopen_script=[SilentSseResponse(clock)],
+        status_script=[{"status": "completed", "output": "recovered from status"}],
+    )
+    result = harness["result"]
+    assert result[0] == "recovered from status", result
+    timeouts = harness["urlopen"].timeouts
+    assert timeouts, harness["trace"]
+    assert timeouts[0] <= _R4_WATCHDOG_BUDGET_BOUND, (
+        f"events read must be bounded by the watchdog budget, got timeout={timeouts[0]}")
+    assert timeouts[0] < 600.0, timeouts
+    status_times = [t for kind, t in harness["trace"] if kind == "status"]
+    assert status_times, harness["trace"]
+    assert status_times[0] <= _R4_WATCHDOG_BUDGET_BOUND, (
+        f"status probe must run within ~one watchdog interval, probed at {status_times[0]}s")
+    assert harness["clock"].now < 600.0, harness["clock"].now
+
+
+def test_r4_stop_during_byte_silence_cancels_within_budget():
+    """Round-4 Greptile item 3 (Stop arm): Stop pressed during byte-silence is
+    honoured within the watchdog budget — the cancel path must run without
+    waiting the full 600s read timeout, and must not spend a status probe on
+    the way out."""
+    clock = FakeClock()
+    stop = FakeCancelEvent(clock)
+    harness = run_turn(
+        clock=clock,
+        cancel_event=stop,
+        urlopen_script=[SilentSseResponse(clock, set_cancel=stop.set)],
+        status_script=[],  # ANY probe here is the bug
+    )
+    assert harness["result"][0] is None, harness["result"]
+    assert any(name == "cancel" for name, _ in harness["events"]), harness["events"]
+    assert harness["status"].calls == 0, "Stop during silence must cancel without a status probe"
+    assert harness["clock"].now <= _R4_WATCHDOG_BUDGET_BOUND, harness["clock"].now
+    timeouts = harness["urlopen"].timeouts
+    assert timeouts and timeouts[0] <= _R4_WATCHDOG_BUDGET_BOUND, timeouts
+
+
+def test_r4_status_waiting_for_approval_surfaces_approval_card_once():
+    """Round-4 Greptile item 4: a durable status of ``waiting_for_approval``
+    carrying the approval payload surfaces the approval card exactly once
+    (mirroring the reattach path's parked-approval surface), even when the
+    events feed never delivered it. A re-probe carrying the same approval key
+    must NOT double-card, and a later ``completed`` status finalizes the turn
+    normally."""
+    import api.config as api_config
+
+    clock = FakeClock()
+    approval_payload = {
+        "approval_id": "appr-r4-1",
+        "tool": "shell",
+        "command": "ls -la /tmp",
+        "description": "list files",
+        "risk_level": "high",
+        "choices": ["once", "always"],
+    }
+    harness = run_turn(
+        clock=clock,
+        urlopen_script=[
+            # Two keepalive-only connections trip the stall watchdog and land
+            # in status arbitration; the events feed never carries the frame.
+            FakeSseResponse(keepalive() * 4, end="eof", clock=clock, advance_per_line=60.0),
+            FakeSseResponse(keepalive() * 4, end="eof", clock=clock, advance_per_line=60.0),
+            FakeSseResponse(
+                sse_frame(0, {"event": "run.completed", "output": "after approval"}),
+                end="eof",
+            ),
+        ],
+        status_script=[
+            {"status": "waiting_for_approval", "approval": dict(approval_payload)},
+            {"status": "waiting_for_approval", "approval": dict(approval_payload)},
+        ],
+        extra_patches=[
+            # keep the capability probe off the scripted urlopen wire
+            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
+        ],
+    )
+    result = harness["result"]
+    assert result[0] == "after approval", (
+        f"run must finalize after the approval lane, got {result!r}")
+    approvals = [payload for name, payload in harness["events"] if name == "approval"]
+    assert len(approvals) == 1, (
+        f"exactly one approval card expected (re-probe must not double-card), "
+        f"got {len(approvals)}: {approvals!r}")
+    assert approvals[0]["approval_id"] == "appr-r4-1", approvals[0]
+    assert approvals[0]["command"] == "ls -la /tmp", approvals[0]
+    assert harness["status"].calls == 2
+
+
+def test_r4_settle_flow_has_single_continue_branch():
+    """Round-4 Greptile item 6: the duplicated dead ``if action == "continue":``
+    block (a porting artifact — the first branch always continued) is gone and
+    the settle flow is linear. The duplicate was unreachable, so no behavioral
+    trace can show it; this pins the source structure instead."""
+    import inspect
+    src = inspect.getsource(gc._run_gateway_runs_api_streaming)
+    count = src.count('action == "continue"')
+    assert count == 1, (
+        f"the settle flow must have exactly one continue branch, found {count}")
+
+
+def test_r4_cancel_marker_scan_stops_at_turn_boundary():
+    """Maintainer must-fix 2: with a PREVIOUS cancelled turn on the session,
+    the cancel-marker backward scan must not cross the new user-turn boundary.
+    The new partial must attach to the NEW cancel marker and the historical
+    rows must stay untouched (pre-fix reload order: old user -> NEW partial ->
+    old cancel -> new user -> new cancel)."""
+    import shutil
+    import tempfile
+    import pathlib
+
+    import api.models as models
+
+    tmp = tempfile.mkdtemp(prefix="watchdog-harness-marker-")
+    saved_dir, saved_index = models.SESSION_DIR, models.SESSION_INDEX_FILE
+    saved_sessions = dict(models.SESSIONS)
+    models.SESSION_DIR = pathlib.Path(tmp)
+    models.SESSION_INDEX_FILE = pathlib.Path(tmp) / "_index.json"
+    models.SESSIONS.clear()
+    saved_partial = gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+    saved_reasoning = gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+    saved_tools = gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+    try:
+        sid = "sess-watchdog-marker-boundary"
+        session = models.Session(session_id=sid, title="Watchdog Harness", messages=[
+            {"role": "user", "content": "first prompt", "timestamp": 1},
+            {"role": "assistant", "content": "first partial answer", "_partial": True, "timestamp": 2},
+            {"role": "assistant", "content": "**Task cancelled:** Cancelled by gateway.",
+             "_error": True, "timestamp": 3},
+        ])
+        session.active_stream_id = STREAM_ID
+        session.pending_user_message = "second prompt"
+        session.pending_attachments = []
+        session.pending_started_at = None
+        session.save()
+        models.SESSIONS[sid] = session
+
+        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = "second partial answer"
+        gc.STREAM_REASONING_TEXT[STREAM_ID] = ""
+        gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = []
+        gc._settle_gateway_cancelled_turn(sid, STREAM_ID)
+
+        models.SESSIONS.pop(sid, None)
+        reloaded = models.get_session(sid)
+        rows = [m for m in reloaded.messages if isinstance(m, dict)]
+        kinds = [
+            "user" if m.get("role") == "user"
+            else "partial" if m.get("_partial")
+            else "marker" if m.get("_error")
+            else "other"
+            for m in rows
+        ]
+        assert kinds == ["user", "partial", "marker", "user", "partial", "marker"], (
+            f"marker scan crossed the turn boundary, rows={kinds}")
+        assert rows[1]["content"] == "first partial answer", rows[1]
+        assert rows[3]["content"] == "second prompt", rows[3]
+        assert rows[4]["content"] == "second partial answer", rows[4]
+    finally:
+        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+        gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+        if saved_partial is not None:
+            gc.STREAM_PARTIAL_TEXT[STREAM_ID] = saved_partial
+        if saved_reasoning is not None:
+            gc.STREAM_REASONING_TEXT[STREAM_ID] = saved_reasoning
+        if saved_tools is not None:
+            gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = saved_tools
+        models.SESSION_DIR, models.SESSION_INDEX_FILE = saved_dir, saved_index
+        models.SESSIONS.clear()
+        models.SESSIONS.update(saved_sessions)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_r4_status_lane_cancel_persists_before_cancel_event():
+    """Maintainer should-fix: the status-lane cancel persists the cancelled
+    turn BEFORE emitting the browser-facing cancel event. The event callback
+    here plays the browser: at the moment the cancel event lands, a fresh
+    reload from disk must already carry the streamed partial row."""
+    import shutil
+    import tempfile
+    import pathlib
+
+    import api.models as models
+
+    tmp = tempfile.mkdtemp(prefix="watchdog-harness-persist-first-")
+    saved_dir, saved_index = models.SESSION_DIR, models.SESSION_INDEX_FILE
+    saved_sessions = dict(models.SESSIONS)
+    models.SESSION_DIR = pathlib.Path(tmp)
+    models.SESSION_INDEX_FILE = pathlib.Path(tmp) / "_index.json"
+    models.SESSIONS.clear()
+    sid = "sess-watchdog-persist-first"
+    try:
+        session = models.Session(session_id=sid, title="Watchdog Harness", messages=[])
+        session.active_stream_id = STREAM_ID
+        session.pending_user_message = "hi"
+        session.pending_attachments = []
+        session.pending_started_at = None
+        session.save()
+        models.SESSIONS[sid] = session
+
+        clock = FakeClock()
+        urlopen = ScriptedUrlopen()
+        status = ScriptedStatus()
+        # A real partial streams on the events connection, then the durable
+        # status resolves cancelled: the persist-first settle must land before
+        # the cancel event reaches this callback.
+        urlopen.queue(FakeSseResponse(
+            sse_frame(0, {"event": "message.delta", "delta": "partial answer so far"}),
+            end="eof"))
+        status.queue({"status": "cancelled"})
+
+        saved = []
+
+        def patch(obj, name, value):
+            saved.append((obj, name, getattr(obj, name)))
+            setattr(obj, name, value)
+
+        refetch_at_event = []
+
+        def on_event(name, payload):
+            if name == "cancel":
+                # The browser handler fetches the session as soon as the
+                # cancel event lands: the sidecar must already carry it.
+                models.SESSIONS.pop(sid, None)
+                reloaded = models.get_session(sid)
+                partials = [m for m in reloaded.messages
+                            if isinstance(m, dict) and m.get("_partial")]
+                refetch_at_event.append(
+                    (len(partials), partials[0].get("content") if partials else None))
+
+        patch(gc, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+        patch(gc, "_admit_gateway_run", lambda *a, **k: RUN_ID)
+        patch(gc, "_get_gateway_run_status", status)
+        patch(urllib.request, "urlopen", urlopen)
+        import api.route_approvals as ra
+
+        patch(ra, "settle_gateway_pending_run", lambda *a, **k: (0, None, 0))
+        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+        gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+        gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+        try:
+            result = gc._run_gateway_runs_api_streaming(
+                sid, "hi", "test-model", "/tmp", STREAM_ID,
+                BASE_URL, "test-key", [], {},
+                put_gateway_event=on_event,
+                cancel_event=FakeCancelEvent(clock),
+            )
+        finally:
+            for obj, name, value in reversed(saved):
+                setattr(obj, name, value)
+            gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+
+        assert result[0] is None, result
+        assert refetch_at_event and refetch_at_event[0] == (1, "partial answer so far"), (
+            f"cancel event raced the persistence, refetch={refetch_at_event!r}")
+        # And the sidecar settles exactly once (one partial, one marker).
+        models.SESSIONS.pop(sid, None)
+        reloaded = models.get_session(sid)
+        assistant = [m for m in reloaded.messages
+                     if isinstance(m, dict) and m.get("role") == "assistant"]
+        partials = [m for m in assistant if m.get("_partial")]
+        markers = [m for m in assistant if m.get("_error")]
+        assert len(partials) == 1 and partials[0].get("content") == "partial answer so far", partials
+        assert len(markers) == 1, markers
+    finally:
+        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+        gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+        models.SESSION_DIR, models.SESSION_INDEX_FILE = saved_dir, saved_index
+        models.SESSIONS.clear()
+        models.SESSIONS.update(saved_sessions)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # --------------------------------------------------------------- Fix 2 -----
 
 
@@ -885,8 +1317,12 @@ def test_status_lane_cancel_persists_partial_reasoning_and_tool_buffers():
         # A prior connection streamed a partial answer before the socket
         # dropped; the durable status then resolved cancelled.
         gc.STREAM_PARTIAL_TEXT[STREAM_ID] = "partial answer so far"
-        # The production call site for the status lane (gateway_chat:
-        # `if final_text is None: _settle_gateway_cancelled_turn(...)`).
+        # The production settle is invoked at TWO sites: inside the streaming
+        # function's status-lane cancel branch (persist-first, round-4) and
+        # at the worker caller (`if final_text is None: ...`) for the other
+        # cancel paths; the second call no-ops on the cleared ownership.
+        # This test drives the canonical settle directly, as the caller site
+        # does, with the worker's own buffers still populated.
         gc._settle_gateway_cancelled_turn(sid, STREAM_ID)
 
         # Fresh reload from disk: the sidecar must carry the partial.
@@ -1054,6 +1490,14 @@ def main():
         test_completed_status_output_preferred_over_streamed_text,
         test_completed_status_stream_writeback_overwrites_partial_text,
         test_completed_status_empty_output_keeps_streamed_text,
+        test_r4_transport_reset_completed_empty_output_returns_partial_text,
+        test_r4_run_completed_frame_latches_terminal_despite_keepalives,
+        test_r4_byte_silent_stream_probes_status_within_watchdog_budget,
+        test_r4_stop_during_byte_silence_cancels_within_budget,
+        test_r4_status_waiting_for_approval_surfaces_approval_card_once,
+        test_r4_settle_flow_has_single_continue_branch,
+        test_r4_cancel_marker_scan_stops_at_turn_boundary,
+        test_r4_status_lane_cancel_persists_before_cancel_event,
     ]
     failed = 0
     for test in tests:
