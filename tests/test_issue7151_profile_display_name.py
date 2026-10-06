@@ -213,7 +213,8 @@ class TestPanelRendering:
 
     def test_detail_title_uses_display_label(self):
         body = _function_body(PANELS_JS, "function _renderProfileDetail(")
-        assert "title.textContent = _profileDisplayLabel(p);" in body
+        assert "title.innerHTML = _profileDisplayLabelHtml(p);" in body
+        assert "title.title = _profileDisplayLabel(p);" in body
 
     def test_dropdown_option_uses_display_label_but_switches_canonical(self):
         body = _function_body(PANELS_JS, "function renderProfileDropdown(data)")

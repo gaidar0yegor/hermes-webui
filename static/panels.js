@@ -6873,7 +6873,8 @@ function _renderProfileDetail(p, activeName){
   const body = $('profileDetailBody');
   const empty = $('profileDetailEmpty');
   if (!title || !body) return;
-  title.textContent = _profileDisplayLabel(p);
+  // Same muted canonical id as the card and the dropdown (Fable UX gate r2).
+  title.innerHTML = _profileDisplayLabelHtml(p);
   // The title ellipsizes; keep the full label (with the canonical id) reachable.
   title.title = _profileDisplayLabel(p);
   const isActive = p.name === activeName;
