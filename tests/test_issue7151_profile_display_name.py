@@ -206,7 +206,7 @@ class TestPanelRendering:
         assert "function _profileDisplayLabel(p){" in PANELS_JS
         body = _function_body(PANELS_JS, "async function loadProfilesPanel()")
         # The card must render the display label, not the bare canonical name.
-        assert "${esc(_profileDisplayLabel(p))}" in body
+        assert "${_profileDisplayLabelHtml(p)}" in body
         # ...but keep the canonical name as the programmatic identity.
         assert "card.dataset.name = p.name;" in body
         assert "openProfileDetail(p.name, card)" in body
@@ -217,7 +217,7 @@ class TestPanelRendering:
 
     def test_dropdown_option_uses_display_label_but_switches_canonical(self):
         body = _function_body(PANELS_JS, "function renderProfileDropdown(data)")
-        assert "${esc(_profileDisplayLabel(p))}" in body
+        assert "${_profileDisplayLabelHtml(p)}" in body
         # Switching must keep using the canonical name (programmatic identity).
         assert "switchToProfile(p.name)" in body
 
@@ -284,3 +284,28 @@ class TestPanelRendering:
         # Structural pin: both render sites carry the guard (drift detector).
         assert "!_profileDisplayLabel(p).endsWith(`(${p.name})`)" in body
         assert "!_profileDisplayLabel(p).endsWith(`(${p.name})`)" in dd_body
+
+
+def test_display_label_html_mutes_the_canonical_id():
+    """Fable UX gate (2026-10-06): in the card and the dropdown the canonical id is muted
+    secondary text, never louder than the display name; the detail title keeps the full
+    label in a title attribute because it ellipsizes."""
+    helper = _function_body(PANELS_JS, "function _profileDisplayLabelHtml(")
+    script = textwrap.dedent(
+        f"""
+        const assert = require('assert');
+        function esc(s) {{ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }}
+        {helper}
+        assert.strictEqual(_profileDisplayLabelHtml({{name: 'research'}}), 'research');
+        assert.strictEqual(_profileDisplayLabelHtml({{name: 'default', display_name: 'default'}}), 'default');
+        assert.strictEqual(
+            _profileDisplayLabelHtml({{name: 'default', display_name: 'Base Profile'}}),
+            'Base Profile <span class="profile-label-id" style="opacity:.5;font-weight:400">(default)</span>');
+        assert.strictEqual(
+            _profileDisplayLabelHtml({{name: 'w<b>', display_name: '<i>x</i>'}}),
+            '&lt;i&gt;x&lt;/i&gt; <span class="profile-label-id" style="opacity:.5;font-weight:400">(w&lt;b&gt;)</span>');
+        """
+    )
+    subprocess.run(["node", "-e", script], check=True)
+    body = _function_body(PANELS_JS, "function _renderProfileDetail(")
+    assert "title.title = _profileDisplayLabel(p);" in body

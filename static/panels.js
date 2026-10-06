@@ -6755,6 +6755,17 @@ function _profileDisplayLabel(p){
   return dn && dn !== name ? `${dn} (${name})` : name;
 }
 
+// HTML form of _profileDisplayLabel for the Profiles card and the profile dropdown:
+// the same text, with the canonical id muted as secondary text (half opacity,
+// normal weight, the style the old "(default)" badge used), so a renamed
+// profile's machine id never reads louder than its name.
+function _profileDisplayLabelHtml(p){
+  const dn = p && typeof p.display_name === 'string' ? p.display_name.trim() : '';
+  const name = p && typeof p.name === 'string' ? p.name : '';
+  if (!(dn && dn !== name)) return esc(name);
+  return `${esc(dn)} <span class="profile-label-id" style="opacity:.5;font-weight:400">(${esc(name)})</span>`;
+}
+
 async function loadProfilesPanel() {
   const panel = $('profilesPanel');
   if (!panel) return;
@@ -6814,7 +6825,7 @@ async function loadProfilesPanel() {
       card.innerHTML = `
         <div class="profile-card-header">
           <div style="min-width:0;flex:1">
-            <div class="profile-card-name${isActive ? ' is-active' : ''}">${gwDot}${esc(_profileDisplayLabel(p))}${defaultBadge}${activeBadge}${hiddenBadge}</div>
+            <div class="profile-card-name${isActive ? ' is-active' : ''}">${gwDot}${_profileDisplayLabelHtml(p)}${defaultBadge}${activeBadge}${hiddenBadge}</div>
             ${meta.length ? `<div class="profile-card-meta">${esc(meta.join(' \u00b7 '))}</div>` : `<div class="profile-card-meta">${esc(t('profile_no_configuration'))}</div>`}
           </div>
         </div>`;
@@ -6863,6 +6874,8 @@ function _renderProfileDetail(p, activeName){
   const empty = $('profileDetailEmpty');
   if (!title || !body) return;
   title.textContent = _profileDisplayLabel(p);
+  // The title ellipsizes; keep the full label (with the canonical id) reachable.
+  title.title = _profileDisplayLabel(p);
   const isActive = p.name === activeName;
   const isDefault = !!p.is_default;
   const statusBadge = isActive
@@ -6986,7 +6999,7 @@ function renderProfileDropdown(data) {
     const gwDot = `<span class="profile-opt-badge ${p.gateway_running ? 'running' : 'stopped'}"></span>`;
     const checkmark = p.name === active ? ' <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--link)" stroke-width="3" style="vertical-align:-1px"><polyline points="20 6 9 17 4 12"/></svg>' : '';
     const defaultBadge = (p.is_default && !_profileDisplayLabel(p).endsWith(`(${p.name})`)) ? ` <span style="opacity:.5;font-weight:400">${esc(t('profile_default_label'))}</span>` : '';
-    opt.innerHTML = `<div class="profile-opt-name">${gwDot}${esc(_profileDisplayLabel(p))}${defaultBadge}${checkmark}</div>` +
+    opt.innerHTML = `<div class="profile-opt-name">${gwDot}${_profileDisplayLabelHtml(p)}${defaultBadge}${checkmark}</div>` +
       (meta.length ? `<div class="profile-opt-meta">${esc(meta.join(' \u00b7 '))}</div>` : '');
     opt.onclick = async () => {
       closeProfileDropdown();
