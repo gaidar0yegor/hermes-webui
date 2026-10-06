@@ -6755,15 +6755,15 @@ function _profileDisplayLabel(p){
   return dn && dn !== name ? `${dn} (${name})` : name;
 }
 
-// HTML form of _profileDisplayLabel for the Profiles card and the profile dropdown:
-// the same text, with the canonical id muted as secondary text (half opacity,
-// normal weight, the style the old "(default)" badge used), so a renamed
-// profile's machine id never reads louder than its name.
+// HTML form of _profileDisplayLabel for the Profiles card, the detail title and the
+// profile dropdown: the same text, with the canonical id muted as secondary text
+// (.profile-label-id: the half-opacity, normal-weight style the old "(default)"
+// badge used), so a renamed profile's machine id never reads louder than its name.
 function _profileDisplayLabelHtml(p){
   const dn = p && typeof p.display_name === 'string' ? p.display_name.trim() : '';
   const name = p && typeof p.name === 'string' ? p.name : '';
   if (!(dn && dn !== name)) return esc(name);
-  return `${esc(dn)} <span class="profile-label-id" style="opacity:.5;font-weight:400">(${esc(name)})</span>`;
+  return `${esc(dn)} <span class="profile-label-id">(${esc(name)})</span>`;
 }
 
 async function loadProfilesPanel() {

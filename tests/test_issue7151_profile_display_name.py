@@ -301,12 +301,19 @@ def test_display_label_html_mutes_the_canonical_id():
         assert.strictEqual(_profileDisplayLabelHtml({{name: 'default', display_name: 'default'}}), 'default');
         assert.strictEqual(
             _profileDisplayLabelHtml({{name: 'default', display_name: 'Base Profile'}}),
-            'Base Profile <span class="profile-label-id" style="opacity:.5;font-weight:400">(default)</span>');
+            'Base Profile <span class="profile-label-id">(default)</span>');
         assert.strictEqual(
             _profileDisplayLabelHtml({{name: 'w<b>', display_name: '<i>x</i>'}}),
-            '&lt;i&gt;x&lt;/i&gt; <span class="profile-label-id" style="opacity:.5;font-weight:400">(w&lt;b&gt;)</span>');
+            '&lt;i&gt;x&lt;/i&gt; <span class="profile-label-id">(w&lt;b&gt;)</span>');
         """
     )
     subprocess.run(["node", "-e", script], check=True)
     body = _function_body(PANELS_JS, "function _renderProfileDetail(")
     assert "title.title = _profileDisplayLabel(p);" in body
+
+
+def test_muted_id_and_hanging_indent_rules_exist():
+    css = (Path(__file__).resolve().parent.parent / "static" / "style.css").read_text(encoding="utf-8")
+    assert ".profile-label-id{opacity:.5;font-weight:400;}" in css
+    assert ".profile-card-name{font-size:13px;font-weight:600;color:inherit;padding-left:12px;text-indent:-12px;}" in css
+    assert ".profile-opt-name{font-size:13px;color:var(--text);font-weight:500;padding-left:12px;text-indent:-12px;}" in css
