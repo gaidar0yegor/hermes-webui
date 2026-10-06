@@ -1655,7 +1655,10 @@
   .session-item.streaming .session-title-row{color:var(--text);}
   .session-text{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;overflow:hidden;}
   .session-title-row{display:flex;align-items:center;gap:6px;min-width:0;}
-  .session-title{flex:1;min-width:20px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);user-select:none;}
+  .session-title{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);user-select:none;}
+  /* #7976: the 20px title floor only matters beside a shrinkable child chip; a childless
+     Detailed-density row keeps master's layout so its non-shrinking prior-turns pill is not clipped. */
+  .session-title-row:has(.session-child-count) .session-title{min-width:20px;}
   .session-search-hit{border-radius:4px;background:var(--accent-bg);color:var(--accent-text);box-decoration-break:clone;-webkit-box-decoration-break:clone;padding:0 .08em;}
   .session-search-preview{font-size:11px;line-height:1.35;color:var(--muted);overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow-wrap:anywhere;opacity:.9;}
   .session-search-hit-preview{background:var(--accent-bg);color:var(--accent-text);}
@@ -5727,6 +5730,11 @@ main.main > #mainPlugin{display:none;}
 .session-child-count-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .session-child-count:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
 .session-child-count-state{width:10px;height:10px;}
+/* #7976 gate (Codex): with fork/worktree/project badges at a 180px sidebar the 6px title-row gaps
+   plus the chip margin pushed the child status mark past the .session-text clip. Tighten only
+   rows that carry a child chip. */
+:root .session-item .session-text .session-title-row:has(.session-child-count){column-gap:2px;}
+.session-title-row .session-child-count{margin-left:0;}
 :root .session-item .session-child-count.is-attention-approval,
 :root .session-item .session-child-count.is-attention-approval:hover{background:color-mix(in srgb,var(--error) 16%,var(--surface));color:var(--error);}
 :root .session-item .session-child-count.is-attention-clarify,
