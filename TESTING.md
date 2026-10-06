@@ -33,6 +33,25 @@ including requests started without a session. The Node harness executes the
 real loaders with deferred responses and PDF-ready/timeout callbacks; it does
 not certify browser rendering or real CDN availability.
 
+## Sidebar child-state presentation
+
+Run `./scripts/test.sh tests/test_child_session_status.py tests/test_child_session_ux.py tests/test_parent_notification_scope.py tests/test_sidebar_tooltips.py tests/test_465_session_branching.py tests/test_session_lineage_collapse.py tests/test_session_touch_actions.py tests/test_issue3242_3214_i18n_tooltips.py`.
+The production attach/render component covers independent parent and child
+notifications, archived reference-only inclusion, state precedence, navigation,
+and localized state-first chip labels in every locale.
+
+With Playwright/Chromium available, run
+`python tests/browser_child_session_status.py --output <artifact-directory>`.
+This credential-free component gate loads production sidebar rendering, CSS and
+i18n without starting an Agent or server. It checks collapsed/expanded rows at
+1280/768/390px, light/dark skins (including all five active-row color-inheritance
+skins), approval/clarify/running/unread, equal fork/delegated spinner sizes,
+44px delegated touch targets, compact desktop rows, clipping, and keyboard/tap
+navigation. Screenshots and computed-style results are saved in the artifact
+directory. These isolated fixtures prove presentation and control behavior, not
+live approval producers or runtime streaming. Also check the full app sidebar
+with real session metadata when verifying an installed build.
+
 ## Static JS runtime lint (brick-class regression guard)
 
 Some JS bugs throw a `TypeError`/`ReferenceError` only when a specific function
@@ -133,6 +152,33 @@ typed `/new` command must focus the composer (and `/new` show its toast), and
 the first message typed with no conversation open must be sent; each reads the
 session list once before that, and shows the new row once the list is released
 (#7936, #7996, #8004). Run it locally with `python tests/browser_new_chat_focus.py`.
+
+## Sidebar child-chip presentation gate
+
+With the existing Playwright/Chromium setup, run:
+
+```bash
+python tests/browser_child_chip_visibility.py --output /path/to/artifacts
+```
+
+This isolated component gate uses the production attachment, row renderer,
+stylesheet, and locale dictionaries; it does not start a server or exercise a
+live Agent. It checks approval plus concurrent running children against parent
+unread/approval/clarify combinations, every `Object.keys(LOCALES)` entry, and
+180px/240px/300px sidebars at desktop, tablet, and phone viewports, in compact
+and detailed density. Measurements reset
+horizontal scrolling and hit-test the chip's status mark before any actionability
+scrolling, using `.session-text` as the clipping boundary. The title retains a
+20px minimum; reference-only chips are capped to preserve useful title space.
+Search-forced expansion and concurrent running must appear in the chip's
+accessible state/name. In detailed density, earlier-turn navigation moves below
+metadata when a child chip is present; its full localized count and cue must fit
+inside the pill, measured with text-range geometry rather than just its box.
+Enter/Space disclosure and keyboard/touch navigation to a prior segment are also
+exercised without relying on hover. `--before-ref <commit>` exercises the exact prior source
+and returns failure when the regression is present. JSON and screenshots are
+written to the chosen artifact directory.
+
 
 ## Public conversation lifecycle gate
 

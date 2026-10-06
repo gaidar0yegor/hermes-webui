@@ -268,6 +268,38 @@ and 5; it does not mark every run-state boundary implemented.
    timestamp (falling back to run start), so a long-running turn cancelled
    moments ago is never mistaken for an orphan.
 
+## Sidebar notification ownership
+
+A conversation row's notification indicator reflects only that conversation's
+own running, unread-completion, or approval/clarification state. Nested child
+sessions (including attached forks) must not light the parent's notification dot,
+hide its timestamp, or add unread/attention styling to it. Activity is distinct
+from notification: when children are collapsed and any child is running, a
+separate spinner on the parent's title row exposes that work without replacing
+its own unread or attention cue. Expanded children show activity on their own
+rows; the parent's own running spinner remains regardless of expansion. A
+reference-only archived child with no expandable rows is treated as collapsed.
+The activity projection clears when child work settles and does not acknowledge
+anything. A separate status mark on the
+child-count chip exposes aggregated child state even while collapsed, including
+reference-only archived children. Approval takes precedence over clarification,
+then other attention, running, and unread completion. Expanded fork and delegated
+child rows expose their own running, unread, and attention states. Rendering or
+expanding the parent does not acknowledge its children; visiting a child retains
+its per-session acknowledgement semantics. Reference-only state does not make
+hidden archived children navigable. Child activity may still affect sidebar
+ordering. Compression-lineage segments remain one logical conversation and are
+not delegated child sessions.
+
+Child-chip tooltips and accessible toggle labels lead with the aggregated state,
+followed by one separator and the localized child count/toggle hint. Approval
+and clarification tint the chip with semantic error/warning colors, including
+when its parent is active. Running and unread retain a plain status mark. A
+reference-only chip uses a localized archived label and is not an expander.
+Fork and delegated row indicators are both 14px; delegated navigation targets
+are at least 44px tall on narrow layouts or coarse pointers, while fine-pointer
+desktop rows remain compact.
+
 ## Client-side unread persistence (sidebar layer)
 
 The sidebar unread dot is backed by two client-side stores in `static/sessions.js`.
