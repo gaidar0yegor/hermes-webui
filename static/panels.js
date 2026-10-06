@@ -6882,7 +6882,8 @@ function _renderProfileDetail(p, activeName){
   const statusBadge = isActive
     ? `<span class="detail-badge active">${esc(t('profile_active'))}</span>`
     : `<span class="detail-badge">Inactive</span>`;
-  const defaultBadge = isDefault ? ` <span class="detail-badge">${esc(t('profile_default_label'))}</span>` : '';
+  // Same guard as the card and the dropdown: a renamed default profile's title already ends in "(default)".
+  const defaultBadge = (isDefault && !_profileDisplayLabel(p).endsWith(`(${p.name})`)) ? ` <span class="detail-badge">${esc(t('profile_default_label'))}</span>` : '';
   const gwBadge = p.gateway_running
     ? `<span class="detail-badge ok">${esc(t('profile_gateway_running'))}</span>`
     : `<span class="detail-badge">${esc(t('profile_gateway_stopped'))}</span>`;
@@ -6999,7 +7000,7 @@ function renderProfileDropdown(data) {
     if (p.total_skills && p.total_skills > 0) meta.push(t('profile_skill_count', p.total_skills).replace(String(p.total_skills), `${p.enabled_skills} / ${p.total_skills}`));
     const gwDot = `<span class="profile-opt-badge ${p.gateway_running ? 'running' : 'stopped'}"></span>`;
     const checkmark = p.name === active ? ' <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--link)" stroke-width="3" style="vertical-align:-1px"><polyline points="20 6 9 17 4 12"/></svg>' : '';
-    const defaultBadge = (p.is_default && !_profileDisplayLabel(p).endsWith(`(${p.name})`)) ? ` <span style="opacity:.5;font-weight:400">${esc(t('profile_default_label'))}</span>` : '';
+    const defaultBadge = (p.is_default && !_profileDisplayLabel(p).endsWith(`(${p.name})`)) ? ` <span class="profile-label-id">${esc(t('profile_default_label'))}</span>` : '';
     opt.innerHTML = `<div class="profile-opt-name">${gwDot}${_profileDisplayLabelHtml(p)}${defaultBadge}${checkmark}</div>` +
       (meta.length ? `<div class="profile-opt-meta">${esc(meta.join(' \u00b7 '))}</div>` : '');
     opt.onclick = async () => {

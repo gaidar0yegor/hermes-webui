@@ -317,3 +317,12 @@ def test_muted_id_and_hanging_indent_rules_exist():
     assert ".profile-label-id{opacity:.5;font-weight:400;}" in css
     assert ".profile-card-name{font-size:13px;font-weight:600;color:inherit;padding-left:12px;text-indent:-12px;}" in css
     assert ".profile-opt-name{font-size:13px;color:var(--text);font-weight:500;padding-left:12px;text-indent:-12px;}" in css
+
+
+def test_detail_status_badge_uses_the_same_suppression_guard():
+    """Fable UX gate r4: the detail view's Status-row "(default)" pill follows the card and
+    dropdown rule, so a renamed default profile doesn't read "(default)" twice."""
+    detail = _function_body(PANELS_JS, "function _renderProfileDetail(")
+    m = re.search(r"const defaultBadge = (.+?) \? ` <span", detail)
+    assert m, "detail defaultBadge guard not found"
+    assert m.group(1) == "(isDefault && !_profileDisplayLabel(p).endsWith(`(${p.name})`))"
