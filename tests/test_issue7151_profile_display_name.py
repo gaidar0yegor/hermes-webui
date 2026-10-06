@@ -193,6 +193,14 @@ def _function_body(src: str, signature: str) -> str:
     raise AssertionError(f"could not find end of {signature}")
 
 
+def _default_badge_condition(body: str) -> str:
+    """Return the real ``defaultBadge`` guard expression from a render-function body,
+    so the node check below evaluates panels.js's own condition, not a re-typed copy."""
+    m = re.search(r"const defaultBadge = (.+?) \? ` <span", body)
+    assert m, "defaultBadge guard not found"
+    return m.group(1)
+
+
 class TestPanelRendering:
     def test_label_helper_defined_and_used_by_panel_card(self):
         assert "function _profileDisplayLabel(p){" in PANELS_JS
@@ -237,13 +245,14 @@ class TestPanelRendering:
         )
 
     def test_composed_row_does_not_duplicate_default_badge(self):
-        """Review #7156: default profile with display_name must not render duplicate (default)."""
+        """Review #7156: a default profile with display_name must not render a duplicate
+        (default). Behavioural check first: evaluate panels.js's REAL defaultBadge guard
+        for the card and the dropdown option under node, so reverting either guard to
+        ``p.is_default`` fails here (not only in the structural asserts below)."""
         body = _function_body(PANELS_JS, "async function loadProfilesPanel()")
-        assert "!_profileDisplayLabel(p).endsWith(`(${p.name})`)" in body
-
         dd_body = _function_body(PANELS_JS, "function renderProfileDropdown(data)")
-        assert "!_profileDisplayLabel(p).endsWith(`(${p.name})`)" in dd_body
-
+        card_cond = _default_badge_condition(body)
+        dd_cond = _default_badge_condition(dd_body)
         helper = _function_body(PANELS_JS, "function _profileDisplayLabel(")
         script = textwrap.dedent(
             f"""
@@ -251,27 +260,27 @@ class TestPanelRendering:
             {helper}
             function esc(s) {{ return s; }}
             function t(k) {{ return k === 'profile_default_label' ? '(default)' : k; }}
-
             function renderCardName(p) {{
-                const label = _profileDisplayLabel(p);
-                const defaultBadge = (p.is_default && !label.endsWith('(' + p.name + ')')) ? ' ' + t('profile_default_label') : '';
-                return label + defaultBadge;
+                const defaultBadge = {card_cond} ? ' ' + t('profile_default_label') : '';
+                return esc(_profileDisplayLabel(p)) + defaultBadge;
             }}
-
-            // Default profile with display_name: renders "Base Profile (default)" without extra "(default)"
+            function renderOptName(p) {{
+                const defaultBadge = {dd_cond} ? ' ' + t('profile_default_label') : '';
+                return esc(_profileDisplayLabel(p)) + defaultBadge;
+            }}
             const renamedDefault = {{ name: 'default', display_name: 'Base Profile', is_default: true }};
-            assert.strictEqual(renderCardName(renamedDefault), 'Base Profile (default)');
-
-            // Default profile without display_name: renders "default (default)"
             const bareDefault = {{ name: 'default', display_name: '', is_default: true }};
-            assert.strictEqual(renderCardName(bareDefault), 'default (default)');
-
-            // Non-default profile with display_name: renders "Worker (worker)"
             const nonDefault = {{ name: 'worker', display_name: 'Worker', is_default: false }};
-            assert.strictEqual(renderCardName(nonDefault), 'Worker (worker)');
+            for (const render of [renderCardName, renderOptName]) {{
+                assert.strictEqual(render(renamedDefault), 'Base Profile (default)');
+                assert.strictEqual(render(bareDefault), 'default (default)');
+                assert.strictEqual(render(nonDefault), 'Worker (worker)');
+            }}
             """
         )
         subprocess.run(
             ["node", "-e", script], cwd=REPO_ROOT, check=True, text=True, capture_output=True
         )
-
+        # Structural pin: both render sites carry the guard (drift detector).
+        assert "!_profileDisplayLabel(p).endsWith(`(${p.name})`)" in body
+        assert "!_profileDisplayLabel(p).endsWith(`(${p.name})`)" in dd_body
