@@ -114,6 +114,12 @@
 
 ### Fixed
 
+- **Each conversation keeps its own reasoning effort.** Picking High in one chat and Low in another used to leave
+  both on the last pick, because the composer's effort chip was profile-wide. The effort is now saved with the
+  conversation and restored when you switch back. A pick also becomes the default for new chats, written to the
+  chat's own profile. Legacy chats fall back to the profile value. While a profile switch finishes saving, the chip
+  is disabled and looks it. Thanks @Notaloop763. (#7881)
+
 - **A MoA preset picked in the model picker runs its reference models once per call, not twice.** The WebUI also
   sent a per-turn `moa_config` for these sessions, which made the Agent run a second, independent MoA round on every
   API call, including each tool iteration, on top of the virtual provider's own. That roughly doubled reference and
