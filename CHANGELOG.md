@@ -114,6 +114,13 @@
 
 ### Fixed
 
+- **The "Move to project" pickers work from the keyboard and fit on phones.** Arrow keys, Home and End move a
+  visible focus ring through the projects; Escape and Tab close the picker and return focus to the conversation's ⋮.
+  The menus are announced as translated menus, and rows are 44 px tall on touch. On a phone in landscape, the single
+  picker is placed like the ⋮ menu: below the conversation when it fits, flipped above when that fits, otherwise
+  slid over the row or pinned with an inner scroll, so "+ New project" is always reachable. The batch picker keeps
+  its rows on screen while you move through it with the keyboard. Thanks @ybai08. (#8052, fixes #8044)
+
 - **Auto-follow holds up during fast streams.** While an agent streams quickly, scrolling up to read no longer yanks
   you back to the bottom, and scrolling down to catch up re-attaches to the tail even though it keeps moving. A
   trackpad jiggle near the bottom no longer drops the follow, and on iOS/Android post-render scroll artifacts and
