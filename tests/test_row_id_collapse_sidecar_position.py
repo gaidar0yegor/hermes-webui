@@ -162,3 +162,61 @@ def test_mixed_bucket_skeletons_and_settled_row_left_untouched():
     # Nothing collapses: every original object is still present, unchanged.
     assert merged_sidecar == sidecar
     assert merged_state == state
+
+
+def test_collapse_with_reasoning_winner_keeps_assistant_in_model_history():
+    """#7903 review (CORE): the state.db winner often carries ``reasoning``
+    mid-stream. Substituting the WHOLE winner row into the sidecar made
+    ``_sanitize_messages_for_api()`` classify it as a reasoning-only display
+    row and skip it, so the assistant turn vanished from the next request's
+    model history (master: u, a, a, u; whole-row head: u, u). Only the provider
+    payload may be carried forward."""
+    import api.models as models
+    from api.streaming import _sanitize_messages_for_api
+
+    sidecar = [
+        _user_row(),
+        _partial_assistant("Reas:", 10),
+        _partial_assistant("Reas: partial", 12),
+        _user_row("next prompt", row_id=24319),
+    ]
+    winner = _partial_assistant("Reas: partial longer", 14)
+    winner["reasoning"] = "thinking about it"
+    state = [_user_row(), winner, _user_row("next prompt", row_id=24319)]
+
+    merged = models.merge_session_messages_append_only(sidecar, state)
+    assert _rows(merged).count(24318) == 1
+    kept = next(m for m in merged if m.get("_row_id") == 24318)
+    assert kept["api_content"] == "Reas: partial longer"
+    assert "reasoning" not in kept
+
+    api_history = _sanitize_messages_for_api(merged)
+    roles = [m.get("role") for m in api_history]
+    assert "assistant" in roles, roles
+    assert roles.index("assistant") < len(roles) - 1  # before the next prompt
+
+
+def test_conflicting_stable_ids_on_one_row_id_are_not_collapsed():
+    """#7903 review (SILENT): snapshots sharing one ``_row_id`` but carrying
+    conflicting stable ``id`` values are different messages to the merge's
+    identity guard. Collapsing them would discard the ``turn-a`` payload;
+    the bucket must be left untouched, exactly as master leaves it."""
+    import api.models as models
+
+    a1 = _partial_assistant("A first", 10)
+    a1["id"] = "turn-a"
+    a2 = _partial_assistant("A first longer", 12)
+    a2["id"] = "turn-a"
+    b1 = _partial_assistant("B other payload, longest of all", 14)
+    b1["id"] = "turn-b"
+    sidecar = [_user_row(), a1, a2]
+    state = [_user_row(), b1]
+
+    collapsed_sidecar, collapsed_state = models._collapse_streaming_row_id_snapshots(
+        list(sidecar), list(state)
+    )
+    assert collapsed_sidecar == sidecar
+    assert collapsed_state == state
+    merged = models.merge_session_messages_append_only(sidecar, state)
+    payloads = {m.get("api_content") for m in merged if m.get("_row_id") == 24318}
+    assert "A first longer" in payloads or "A first" in payloads

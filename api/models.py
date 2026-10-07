@@ -13594,9 +13594,10 @@ def _collapse_streaming_row_id_snapshots(sidecar_messages: list, state_messages:
     per durable row id among streaming skeletons.
 
     A collapsed row keeps exactly one copy *per source list*, at the position
-    of that list's first snapshot, carrying the winning payload (a shallow copy
-    for the list that did not supply the winner, so neither list shares the
-    other's dict).  Deleting the losing list's copy instead would make the
+    of that list's first snapshot, carrying the winning provider payload
+    (``api_content`` and an advanced ``finish_reason``) on a shallow copy of that
+    list's own row, so neither list shares the other's dict and no other field
+    of the winner (e.g. ``reasoning``) leaks into the other list's row.  Deleting the losing list's copy instead would make the
     append-only merge treat the row as sidecar-only-then-later-rows and drop
     it from the result entirely when the winner lives in ``state.db``.
 
@@ -13620,11 +13621,27 @@ def _collapse_streaming_row_id_snapshots(sidecar_messages: list, state_messages:
     # A durable id counts as pure-streaming only when *every* member row with
     # that id is a skeleton.  Mixed buckets are the provider's "two distinct
     # payloads" territory and stay untouched.
+    def _stable_ids_agree(group: list) -> bool:
+        # #7903 review (SILENT): rows that share one _row_id but carry
+        # conflicting stable ``id``/``message_id`` values are different
+        # messages to the merge's identity guard (master keeps both). Collapse
+        # only when every member's stable id is valid and they agree or are
+        # absent; otherwise the bucket is left untouched.
+        seen: set[str] = set()
+        for member in group:
+            stable_id, stable_valid = _stable_message_identity_details(member)
+            if not stable_valid:
+                return False
+            if stable_id is not None:
+                seen.add(stable_id)
+        return len(seen) <= 1
+
     collapsed_ids = {
         row_id
         for row_id, group in buckets.items()
         if len(group) > 1
         and all(_is_streaming_row_snapshot(m) for m in members[row_id])
+        and _stable_ids_agree(members[row_id])
     }
     if not collapsed_ids:
         return sidecar_messages, state_messages
@@ -13667,7 +13684,12 @@ def _collapse_streaming_row_id_snapshots(sidecar_messages: list, state_messages:
                 # assistant turn from the next request's model history.
                 # Shallow copy so the lists never share a dict the reconciler
                 # might mutate.
-                out.append(dict(winner))
+                carried = dict(msg)
+                carried["api_content"] = winner.get("api_content")
+                winner_finish = winner.get("finish_reason")
+                if winner_finish not in (None, ""):
+                    carried["finish_reason"] = winner_finish
+                out.append(carried)
         return out
 
     return _filter(sidecar_messages), _filter(state_messages)
