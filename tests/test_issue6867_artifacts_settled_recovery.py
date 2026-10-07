@@ -182,6 +182,7 @@ def test_restore_settled_session_projects_through_production_path(browser):
               window._clearSource = () => {};
               window._closeSource = () => {};
               window._isSessionCurrentPane = sid => !!S.session && S.session.session_id === sid;
+              window._streamCompressionContinuationSid = '';
               window._streamFinalized = false;
               window._persistTimer = null;
               window._cancelThrottledSnapshotTimer = () => {};

@@ -150,7 +150,7 @@ def test_snapshot_restore_rechecks_request_owner_after_await():
     script = r"""
 const assert=require('assert');
 const activeSid='current',streamId='turn-1';
-let current=true,resolveSnapshot;
+let current=true,resolveSnapshot,_streamCompressionContinuationSid='';
 const S={session:{session_id:activeSid},activeStreamId:streamId};
 let _streamFinalized=false;
 function _isActiveSession(){return true;}

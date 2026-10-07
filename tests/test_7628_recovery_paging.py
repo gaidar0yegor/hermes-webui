@@ -149,6 +149,7 @@ function runtimeStubs() {
   globalThis._currentMessageRenderWindowSize = () => scenario.currentWindowSize || 12;
   globalThis._restoreMessageRenderWindowAfterSettledRender = () => calls.push('restoreRenderWindow');
   globalThis.projectSessionArtifactsForOwner = () => calls.push('projectArtifacts');
+  globalThis._streamCompressionContinuationSid = '';
   globalThis._streamFinalized = false;
   globalThis._persistTimer = null;
   globalThis._attachProjectedAnchorSceneToLastAssistant = () => calls.push('attachProjected');
