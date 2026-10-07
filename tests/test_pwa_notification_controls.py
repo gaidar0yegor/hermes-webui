@@ -603,6 +603,9 @@ function extractFunction(src, marker) {
   throw new Error('unbalanced ' + marker);
 }
 const SESSION_URL_FN = extractFunction(SESSIONS, 'function _sessionUrlForSid');
+// _notificationOptions builds its sessionless fallback URL from _appRootPath()
+// (#7652), so the real helper is extracted alongside _sessionUrlForSid.
+const APP_ROOT_FN = extractFunction(SESSIONS, 'function _appRootPath');
 
 // --- minimal DOM/browser element stub ---
 function makeElement() {
@@ -757,10 +760,11 @@ function buildSandbox(scenario) {
   return sandbox;
 }
 
-function runScenario(scenario) {
+async function runScenario(scenario) {
   const sandbox = buildSandbox(scenario);
   vm.createContext(sandbox);
   vm.runInContext(SESSION_URL_FN, sandbox);
+  vm.runInContext(APP_ROOT_FN, sandbox);
   vm.runInContext(MESSAGES, sandbox);
   const driver = `
     const S={session:{session_id:'parent',message_count:2},messages:[],toolCalls:[],busy:false,activeStreamId:'stream-1',todos:[],todoStateMeta:null};
@@ -774,15 +778,19 @@ function runScenario(scenario) {
     const __src=LIVE_STREAMS['parent'].source;
     if(!__src) throw new Error('no source wired');
     __src.dispatch('done', ${JSON.stringify(scenario.donePayload)});
-    __out={
+    // sendBrowserNotification delivers asynchronously (it awaits the PWA
+    // service-worker path, then falls back to new Notification), so the
+    // report is read only after the event loop has drained.
+    __report=function(){return {
       captured: __captured.map(function(c){return {title:c.title, tag:c.options.tag, url:c.options.data.url, body:c.options.body};}),
       count: __captured.length,
       sessionAfterDone: (S.session&&S.session.session_id)||null,
       expectedUrl: location.origin + _sessionUrlForSid('${scenario.expectedSid}'),
-    };
+    };};
   `;
   vm.runInContext(driver, sandbox);
-  return sandbox.__out;
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  return sandbox.__report();
 }
 
 const scenarios = {
@@ -830,15 +838,17 @@ const scenarios = {
   },
 };
 
-const out = {};
-for (const name of Object.keys(scenarios)) {
-  try {
-    out[name] = runScenario(scenarios[name]);
-  } catch (err) {
-    out[name] = { error: String(err && err.stack || err) };
+(async () => {
+  const out = {};
+  for (const name of Object.keys(scenarios)) {
+    try {
+      out[name] = await runScenario(scenarios[name]);
+    } catch (err) {
+      out[name] = { error: String(err && err.stack || err) };
+    }
   }
-}
-console.log(JSON.stringify(out, null, 2));
+  console.log(JSON.stringify(out, null, 2));
+})();
 """
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node required for behavioral test")
